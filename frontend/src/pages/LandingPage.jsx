@@ -116,14 +116,16 @@ export default function LandingPage() {
                 </span>
               </div>
 
-              <h1 className="hero-title text-5xl md:text-6xl lg:text-7xl font-extrabold tracking-tight mb-8">
-                <span className="block type-line line-1">
+              <h1 className="hero-title text-5xl md:text-6xl lg:text-7xl font-extrabold tracking-tight leading-[1.05] mb-8">
+                <span className="type-line line-1">
                   Decentralized
                 </span>
-                <span className="block text-emerald-400 type-line line-2 drop-shadow-lg">
+                <br />
+                <span className="text-emerald-400 type-line line-2 drop-shadow-lg">
                   Intelligence
                 </span>
-                <span className="block type-line line-3">
+                <br />
+                <span className="type-line line-3">
                   Layer.
                 </span>
               </h1>
