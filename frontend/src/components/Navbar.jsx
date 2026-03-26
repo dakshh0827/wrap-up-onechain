@@ -19,7 +19,7 @@ import {
 import { Transaction } from '@mysten/sui/transactions';
 import { PACKAGE_ID } from "../constants";
 
-const API_BASE = 'https://wrap-up-evolved.onrender.com/api';
+const API_BASE = 'http://localhost:5001/api';
 
 export default function Navbar() {
   const { userPoints, displayName, setUserPoints, setDisplayName, setProfileObjectId } = useArticleStore();  const [newName, setNewName] = useState("");

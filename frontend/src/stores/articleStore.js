@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import axios from "axios";
 
-const API_BASE = '/api';
+const API_BASE = 'http://localhost:5001/api';
 
 export const useArticleStore = create((set, get) => ({
   // 1. STATE

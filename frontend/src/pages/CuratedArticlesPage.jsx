@@ -9,7 +9,7 @@ import { useNavigate } from "react-router-dom";
 import axios from "axios";
 import { BookOpen, ThumbsUp, MessageSquare, Inbox, Hexagon, FileText, TrendingUp, Plus, AlertCircle } from "lucide-react";
 
-const API_BASE = 'https://wrap-up-evolved.onrender.com/api';
+const API_BASE = 'http://localhost:5001/api';
 
 export default function CuratedArticlesPage() {
   const navigate = useNavigate();
