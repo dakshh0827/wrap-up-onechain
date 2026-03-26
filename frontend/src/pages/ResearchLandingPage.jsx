@@ -7,15 +7,12 @@ import { Button, Card, Badge } from "../components/ui";
 import BlockchainBackground from "../components/ui/BlockchainBackground";
 import toast from "react-hot-toast";
 import axios from "axios";
-import {
-  useAccount,
-  useWriteContract,
-  useWaitForTransactionReceipt,
-  useChainId,
-  useSwitchChain,
-} from "wagmi";
-import { WRAPUP_ABI, CONTRACT_ADDRESSES } from "../wagmiConfig";
-import { decodeEventLog } from "viem";
+
+// --- OneChain / Sui Imports ---
+import { ConnectButton, useCurrentAccount, useSuiClient, useSignAndExecuteTransaction } from "@mysten/dapp-kit";
+import { Transaction } from "@mysten/sui/transactions";
+import { PACKAGE_ID, MODULE_NAME, CLOCK_ID } from "../constants";
+
 import { 
   Brain, Sparkles, Search, BarChart3, 
   Globe, Zap, X, ArrowRight, CheckCircle, Circle, Loader, Scale, Link2
@@ -34,21 +31,26 @@ export default function ResearchLandingPage() {
   const [savedResearch, setSavedResearch] = useState(null);
   const [ipfsHash, setIpfsHash] = useState(null);
   const [txDone, setTxDone] = useState(false);
+  
+  // Profile State
+  const [needsProfile, setNeedsProfile] = useState(false);
 
-  const { isConnected, address } = useAccount();
-  const chainId = useChainId();
-  const { switchChain } = useSwitchChain();
+  // OneChain Hooks
+  const account = useCurrentAccount();
+  const suiClient = useSuiClient();
+  const { mutate: signAndExecuteTransaction, isPending: isTxPending } = useSignAndExecuteTransaction();
 
-  const currentContractAddress = CONTRACT_ADDRESSES[chainId] || CONTRACT_ADDRESSES[421614];
-
-  const { data: hash, isPending, writeContract, error: writeError } = useWriteContract();
-  const {
-    data: receipt,
-    isLoading: isConfirming,
-    isSuccess: isConfirmed,
-    isError: isTxError,
-    error: txError,
-  } = useWaitForTransactionReceipt({ hash });
+  // Check if user has a profile when they connect
+  useEffect(() => {
+    if (account) {
+      suiClient.getOwnedObjects({
+        owner: account.address,
+        filter: { StructType: `${PACKAGE_ID}::${MODULE_NAME}::UserProfile` },
+      }).then(res => {
+        setNeedsProfile(res.data.length === 0);
+      }).catch(console.error);
+    }
+  }, [account, suiClient]);
 
   const handleResearch = async (e) => {
     e?.preventDefault();
@@ -100,9 +102,29 @@ export default function ResearchLandingPage() {
     setTopic(prompt);
   };
 
+  // --- ONECHAIN: Profile Registration ---
+  const handleRegisterProfile = () => {
+    const tx = new Transaction();
+    tx.moveCall({
+      target: `${PACKAGE_ID}::${MODULE_NAME}::register_user`,
+      arguments: [],
+    });
+
+    signAndExecuteTransaction({ transaction: tx }, {
+      onSuccess: () => {
+        toast.success("Profile created successfully!");
+        setNeedsProfile(false);
+      },
+      onError: (err) => {
+        toast.error("Failed to create profile: " + err.message);
+      }
+    });
+  };
+
+  // --- ONECHAIN: Curation & Minting ---
   const handleCurate = async () => {
     if (!researchPreview) return;
-    if (!isConnected) {
+    if (!account) {
       toast.error("Connect wallet to curate");
       return;
     }
@@ -111,32 +133,80 @@ export default function ResearchLandingPage() {
     setTxDone(false);
 
     try {
+      // Step 0: Save to DB
       setStepIndex(0);
       const res = await axios.post(`${API_BASE}/research/generate`, { action: 'prepare', reportData: researchPreview });
       const dbResearch = res.data.report;
       setSavedResearch(dbResearch);
 
+      // Step 1: Upload to IPFS
       setStepIndex(1);
       const ipfsRes = await axios.post(`${API_BASE}/research/upload-ipfs`, { researchId: dbResearch.id });
       const generatedHash = ipfsRes.data.ipfsHash;
       if (!generatedHash) throw new Error("IPFS upload failed");
       setIpfsHash(generatedHash);
 
+      // Step 2: Ensure Profile Exists & Get ID
       setStepIndex(2);
-      const doWrite = () => {
-        writeContract({
-          address: currentContractAddress,
-          abi: WRAPUP_ABI,
-          functionName: "submitArticle",
-          args: [generatedHash],
-        });
-      };
+      const objects = await suiClient.getOwnedObjects({
+        owner: account.address,
+        filter: { StructType: `${PACKAGE_ID}::${MODULE_NAME}::UserProfile` },
+      });
 
-      if (!CONTRACT_ADDRESSES[chainId]) {
-        switchChain({ chainId: 421614 }, { onSuccess: doWrite, onError: () => { toast.error("Network switch failed"); setLoading(false); setStepIndex(-1); } });
-      } else {
-        doWrite();
+      if (objects.data.length === 0) {
+        toast.error("Critical: Profile not found. Please refresh and create a profile.");
+        setLoading(false);
+        setStepIndex(-1);
+        return;
       }
+      const profileId = objects.data[0].data.objectId;
+
+      // Step 3: Build & Execute Move Transaction
+      const tx = new Transaction();
+      tx.moveCall({
+        target: `${PACKAGE_ID}::${MODULE_NAME}::submit_ai_research`,
+        arguments: [
+          tx.object(profileId),
+          tx.pure.string(generatedHash),
+          tx.object(CLOCK_ID)
+        ],
+      });
+
+      signAndExecuteTransaction({ 
+        transaction: tx, 
+        options: { showEvents: true } // We need the events to get the Report ID
+      }, {
+        onSuccess: (result) => {
+          // Extract the object ID from the emitted event
+          const event = result.events?.find(e => e.type.includes("ReportSubmittedEvent"));
+          const onChainId = event ? event.parsedJson.report_id : result.digest;
+
+          // Step 4: Sync with Backend
+          axios.post(`${API_BASE}/research/mark-onchain`, { 
+            researchId: dbResearch.id, 
+            blockchainId: onChainId, 
+            curator: account.address, 
+            ipfsHash: generatedHash 
+          })
+          .then(() => {
+            setStepIndex(3); 
+            setTxDone(true); 
+            toast.success("Curated on OneChain!");
+            setLoading(false);
+            setTimeout(() => navigate(`/research/${dbResearch.id}`), 2000);
+          }).catch((err) => { 
+            toast.error("DB sync failed"); 
+            setLoading(false); 
+          });
+        },
+        onError: (err) => {
+          toast.error("Transaction failed: " + err.message);
+          if (dbResearch?.id) { axios.delete(`${API_BASE}/research/${dbResearch.id}`).catch(() => {}); setSavedResearch(null); }
+          setStepIndex(-1);
+          setLoading(false);
+        }
+      });
+
     } catch (err) {
       toast.error(err.response?.data?.error || err.message || "Curation failed");
       if (savedResearch?.id) { await axios.delete(`${API_BASE}/research/${savedResearch.id}`).catch(() => {}); setSavedResearch(null); }
@@ -144,38 +214,6 @@ export default function ResearchLandingPage() {
       setLoading(false);
     }
   };
-
-  useEffect(() => {
-    if (isPending) toast.loading("Waiting for wallet...", { id: "mintToast" });
-    if (isConfirming) { setStepIndex(2); toast.loading("Confirming...", { id: "mintToast" }); }
-
-    if (isConfirmed && receipt && ipfsHash && savedResearch) {
-      let onChainId = null;
-      try {
-        for (const log of receipt.logs) {
-          const event = decodeEventLog({ abi: WRAPUP_ABI, data: log.data, topics: log.topics });
-          if (event.eventName === "ArticleSubmitted") { onChainId = event.args.articleId.toString(); break; }
-        }
-      } catch {}
-
-      if (onChainId && address) {
-        axios.post(`${API_BASE}/research/mark-onchain`, { researchId: savedResearch.id, blockchainId: onChainId, curator: address, ipfsHash })
-        .then(() => {
-          setStepIndex(3); setTxDone(true); toast.success("Curated on-chain!", { id: "mintToast" }); setLoading(false);
-          setTimeout(() => navigate(`/research/${savedResearch.id}`), 2000);
-        }).catch((err) => { toast.error("DB sync failed", { id: "mintToast" }); setLoading(false); });
-      } else {
-        setStepIndex(3); setTxDone(true); toast.success("Minted!", { id: "mintToast" }); setLoading(false);
-        setTimeout(() => navigate(`/research/${savedResearch.id}`), 2000);
-      }
-    }
-
-    if (isTxError || writeError) {
-      toast.error("Transaction failed.", { id: "mintToast" });
-      if (savedResearch?.id) { axios.delete(`${API_BASE}/research/${savedResearch.id}`).catch(() => {}); setSavedResearch(null); }
-      setStepIndex(-1); setLoading(false);
-    }
-  }, [isPending, isConfirming, isConfirmed, isTxError, receipt, writeError, txError, savedResearch, ipfsHash, address, navigate]);
 
   const handleReset = () => {
     setTopic(""); setResearchPreview(null); setSavedResearch(null); setIpfsHash(null); setTxDone(false); setStepIndex(-1); setStage("idle");
@@ -190,13 +228,15 @@ export default function ResearchLandingPage() {
     }
   };
 
-  const isProcessing = loading || isPending || isConfirming;
+  const isProcessing = loading || isTxPending;
   
   const getButtonLabel = () => {
+    if (!account) return "Connect Wallet to Mint";
+    if (needsProfile) return "Create Profile First";
     if (stepIndex === -1 && !loading) return "Curate & Mint Report";
     if (stepIndex === 0) return "Saving Database...";
     if (stepIndex === 1) return "Pinning to IPFS...";
-    if (stepIndex === 2 && (isPending || isConfirming)) return "Confirming on Chain...";
+    if (stepIndex === 2 && isTxPending) return "Confirming on OneChain...";
     if (txDone) return "Successfully Minted!";
     return "Curate & Mint Report";
   };
@@ -238,8 +278,7 @@ export default function ResearchLandingPage() {
 
               {/* Wallet Connections */}
               <div className="flex items-center justify-center gap-4 mb-10">
-                <w3m-button />
-                <w3m-network-button />
+                <ConnectButton />
               </div>
 
               {/* Search Form */}
@@ -405,14 +444,14 @@ export default function ResearchLandingPage() {
                   {/* Action Button */}
                   <div className="flex justify-end pt-6 border-t border-zinc-800/50">
                     <Button
-                      onClick={handleCurate}
-                      disabled={isProcessing || txDone || !isConnected}
+                      onClick={needsProfile ? handleRegisterProfile : handleCurate}
+                      disabled={isProcessing || txDone || !account}
                       size="lg"
                       className={`px-8 py-3.5 ${txDone ? "bg-emerald-500 hover:bg-emerald-500 text-black shadow-lg shadow-emerald-500/20 cursor-default" : "shadow-lg shadow-emerald-500/20"}`}
                     >
                       {isProcessing && <Loader className="w-4 h-4 animate-spin mr-2" />}
-                      {!isConnected ? "Connect Wallet to Mint" : getButtonLabel()}
-                      {!isProcessing && !txDone && isConnected && <ArrowRight className="w-4 h-4 ml-2" />}
+                      {getButtonLabel()}
+                      {!isProcessing && !txDone && account && !needsProfile && <ArrowRight className="w-4 h-4 ml-2" />}
                     </Button>
                   </div>
                 </div>

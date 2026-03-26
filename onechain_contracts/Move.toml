@@ -1,0 +1,9 @@
+[package]
+name = "wrap_up"
+edition = "2024.beta" 
+
+[dependencies]
+One = { git = "https://github.com/one-chain-labs/onechain.git", subdir = "crates/sui-framework/packages/one-framework", rev = "main" }
+
+[addresses]
+wrap_up = "0x0"

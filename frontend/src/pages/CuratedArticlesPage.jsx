@@ -78,7 +78,7 @@ export default function CuratedArticlesPage() {
                   <h1 className="text-4xl md:text-5xl font-extrabold text-white tracking-tight drop-shadow-md">Legacy Curation</h1>
                 </div>
                 <p className="text-zinc-400 max-w-xl text-lg leading-relaxed">
-                  Curated insights from across the decentralized web. Verified by community, permanently stored on Arbitrum.
+                  Curated insights from across the decentralized web. Verified by community, permanently stored on OneChain.
                 </p>
               </div>
               

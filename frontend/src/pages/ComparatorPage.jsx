@@ -1,25 +1,25 @@
-import React, { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import React, { useState } from "react";
 import Navbar from "../components/Navbar";
 import Footer from "../components/Footer";
 import { Section } from "../components/Layout";
-import { Button, Card, Badge, StepIndicator } from "../components/ui";
+import { Button, Card, Badge } from "../components/ui";
 import BlockchainBackground from "../components/ui/BlockchainBackground";
 import axios from "axios";
 import toast from "react-hot-toast";
-import {
-  useAccount,
-  useWriteContract,
-  useWaitForTransactionReceipt,
-  useChainId,
-  useSwitchChain,
-} from "wagmi";
-import { WRAPUP_ABI, CONTRACT_ADDRESSES } from "../wagmiConfig";
-import { decodeEventLog } from "viem";
+
+// --- OneChain / Sui Imports ---
+import { 
+  useCurrentAccount, 
+  useSignAndExecuteTransaction, 
+  useSuiClient 
+} from '@mysten/dapp-kit';
+import { Transaction } from '@mysten/sui/transactions';
+import { PACKAGE_ID, CLOCK_ID } from "../constants";
+
 import {
   Scale, Link2, Loader, Trophy, Shield, Zap, Globe,
-  Star, AlertCircle, CheckCircle, XCircle, TrendingUp, BookOpen,
-  ArrowRight, Hexagon, BarChart3, Circle,
+  Star, CheckCircle, TrendingUp, BookOpen,
+  ArrowRight, Hexagon, Circle,
 } from "lucide-react";
 import { useArticleStore } from "../stores/articleStore";
 
@@ -79,8 +79,6 @@ function ArticleCard({ meta, label, accent }) {
   );
 }
 
-const PUBLISH_STEPS = ["Save to DB", "Upload IPFS", "Sign Tx", "Confirmed"];
-
 export default function ComparatorPage() {
   const [urlOne, setUrlOne] = useState("");
   const [urlTwo, setUrlTwo] = useState("");
@@ -91,28 +89,12 @@ export default function ComparatorPage() {
   const [publishIpfsHash, setPublishIpfsHash] = useState(null);
   const [savedComparison, setSavedComparison] = useState(null);
 
-  const { address, isConnected } = useAccount();
-  const chainId = useChainId();
-  const { switchChain } = useSwitchChain();
   const { deleteComparisonFromDB } = useArticleStore();
 
-  const currentContractAddress = CONTRACT_ADDRESSES[chainId] || CONTRACT_ADDRESSES[421614];
-
-  const {
-    data: publishHash,
-    isPending: isPublishing,
-    writeContract: writePublish,
-    error: publishWriteError,
-    isError: isPublishWriteError,
-  } = useWriteContract();
-
-  const {
-    isLoading: isPublishConfirming,
-    isSuccess: isPublishConfirmed,
-    isError: isPublishTxError,
-    error: publishTxError,
-    data: publishReceipt,
-  } = useWaitForTransactionReceipt({ hash: publishHash });
+  // --- OneChain Hooks ---
+  const account = useCurrentAccount();
+  const suiClient = useSuiClient();
+  const { mutate: signAndExecuteTransaction } = useSignAndExecuteTransaction();
 
   const handleCompare = async (e) => {
     e.preventDefault();
@@ -143,18 +125,20 @@ export default function ComparatorPage() {
   };
 
   const handleCurate = async () => {
-    if (!isConnected) { toast.error("Connect wallet to publish"); return; }
+    if (!account) { toast.error("Connect wallet to publish"); return; }
     if (!comparison) return;
 
     setPublishStep(0);
     const tid = toast.loading("Publishing comparison on-chain...");
 
     try {
+      // 1. Database Prep
       const res = await axios.post(`${API_BASE}/comparisons/generate`, { action: 'prepare', comparisonData: comparison });
       const dbComp = res.data.comparison;
       setSavedComparison(dbComp);
       setPublishStep(1);
 
+      // 2. IPFS Upload
       toast.loading("Uploading to IPFS...", { id: tid });
       const ipfsRes = await axios.post(`${API_BASE}/comparisons/upload-ipfs`, { comparisonId: dbComp.id });
       const { ipfsHash } = ipfsRes.data;
@@ -162,31 +146,71 @@ export default function ComparatorPage() {
       setPublishIpfsHash(ipfsHash);
       setPublishStep(2);
 
-      toast.loading("Sign transaction in wallet...", { id: tid });
+      // 3. OneChain Transaction Building
+      toast.loading("Querying OneChain Profile...", { id: tid });
+      
+      // Fetch the user's UserProfile object from their wallet
+      const ownedObjects = await suiClient.getOwnedObjects({
+        owner: account.address,
+        filter: { StructType: `${PACKAGE_ID}::platform::UserProfile` },
+      });
 
-      const doWrite = () => {
-        writePublish({
-          address: currentContractAddress,
-          abi: WRAPUP_ABI,
-          functionName: "submitArticle",
-          args: [ipfsHash],
-        });
-      };
-
-      if (!CONTRACT_ADDRESSES[chainId]) {
-        switchChain(
-          { chainId: 421614 },
-          {
-            onSuccess: doWrite,
-            onError: () => {
-              toast.error("Network switch failed", { id: tid });
-              setPublishStep(-1);
-            },
-          }
-        );
-      } else {
-        doWrite();
+      if (ownedObjects.data.length === 0) {
+        throw new Error("You must register a UserProfile on OneChain first!");
       }
+
+      const userProfileId = ownedObjects.data[0].data.objectId;
+
+      toast.loading("Sign transaction in OneWallet...", { id: tid });
+
+      const tx = new Transaction();
+      tx.moveCall({
+        target: `${PACKAGE_ID}::platform::submit_ai_research`,
+        arguments: [
+          tx.object(userProfileId),
+          tx.pure.string(ipfsHash),
+          tx.object(CLOCK_ID)
+        ],
+      });
+
+      // Execute the transaction
+      signAndExecuteTransaction(
+        { transaction: tx },
+        {
+          onSuccess: async (result) => {
+            setPublishStep(3);
+            toast.loading("Finalizing Database Sync...", { id: tid });
+            
+            try {
+              // Note: Using the transaction digest (hash) as the blockchainId for DB syncing
+              await axios.post(`${API_BASE}/comparisons/mark-onchain`, {
+                comparisonId: dbComp.id,
+                blockchainId: result.digest, 
+                curator: account.address,
+                ipfsHash: ipfsHash,
+              });
+              
+              toast.success("Comparison published to OneChain!", { id: tid });
+              setComparison((prev) => ({ 
+                ...prev, 
+                onChain: true, 
+                blockchainId: result.digest, 
+                ipfsHash: ipfsHash 
+              }));
+              setPublishStep(-1);
+            } catch (syncErr) {
+              toast.error("DB sync failed: " + syncErr.message, { id: tid });
+              setPublishStep(-1);
+            }
+          },
+          onError: (txErr) => {
+            toast.error(txErr.message || "Transaction failed", { id: tid });
+            if (dbComp?.id) deleteComparisonFromDB(dbComp.id);
+            setPublishStep(-1);
+          }
+        }
+      );
+
     } catch (err) {
       toast.error(err.message || "Publish failed", { id: tid });
       if (savedComparison?.id) {
@@ -197,61 +221,7 @@ export default function ComparatorPage() {
     }
   };
 
-  useEffect(() => {
-    if (isPublishing) toast.loading("Waiting for wallet...", { id: "compPubToast" });
-    if (isPublishConfirming) { setPublishStep(2); toast.loading("Confirming on blockchain...", { id: "compPubToast" }); }
-
-    if (isPublishConfirmed && publishReceipt && savedComparison && publishIpfsHash) {
-      setPublishStep(3);
-      let blockchainId = null;
-      try {
-        for (const log of publishReceipt.logs) {
-          const event = decodeEventLog({ abi: WRAPUP_ABI, data: log.data, topics: log.topics });
-          if (event.eventName === "ArticleSubmitted") { blockchainId = event.args.articleId.toString(); break; }
-        }
-      } catch {}
-
-      if (blockchainId && address) {
-        toast.loading("Finalizing...", { id: "compPubToast" });
-        axios.post(`${API_BASE}/comparisons/mark-onchain`, {
-          comparisonId: savedComparison.id,
-          blockchainId,
-          curator: address,
-          ipfsHash: publishIpfsHash,
-        }).then(() => {
-          toast.success("Comparison published on-chain!", { id: "compPubToast" });
-          setComparison((prev) => ({ ...prev, onChain: true, blockchainId: parseInt(blockchainId), ipfsHash: publishIpfsHash }));
-          setPublishStep(-1);
-        }).catch((err) => {
-          toast.error("DB sync failed: " + err.message, { id: "compPubToast" });
-          setPublishStep(-1);
-        });
-      } else {
-        toast.success("Published on-chain!", { id: "compPubToast" });
-        setComparison((prev) => ({ ...prev, onChain: true, ipfsHash: publishIpfsHash }));
-        setPublishStep(-1);
-      }
-    }
-
-    if (isPublishTxError || isPublishWriteError) {
-      toast.error(publishTxError?.shortMessage || publishWriteError?.shortMessage || "Transaction failed", { id: "compPubToast" });
-      if (savedComparison?.id) {
-        deleteComparisonFromDB(savedComparison.id);
-        setSavedComparison(null);
-      }
-      setPublishStep(-1);
-    }
-  }, [isPublishing, isPublishConfirming, isPublishConfirmed, isPublishTxError, isPublishWriteError, publishReceipt, savedComparison, publishIpfsHash, address, deleteComparisonFromDB]);
-
   const report = comparison?.report;
-  const dims = report?.dimensions ? Object.entries(report.dimensions) : [];
-
-  const wins = { article1: 0, article2: 0 };
-  dims.forEach(([, d]) => {
-    if (d.winner === "article1") wins.article1++;
-    else if (d.winner === "article2") wins.article2++;
-  });
-
   const isPublishInProgress = publishStep >= 0;
   const isFullyRevealed = comparison?.onChain || publishStep === 3;
 
@@ -283,7 +253,7 @@ export default function ComparatorPage() {
                 </span>
               </h1>
               <p className="text-zinc-400 text-lg max-w-2xl mx-auto leading-relaxed">
-                Paste two URLs. AI scrapes and evaluates across 8 dimensions. Mint securely to view the full deep-dive consensus.
+                Paste two URLs. AI scrapes and evaluates across 8 dimensions. Mint securely to OneChain to view the full deep-dive consensus.
               </p>
             </div>
 
@@ -396,7 +366,7 @@ export default function ComparatorPage() {
                     
                     <div className="p-8 text-center">
                       <p className="text-zinc-400 mb-8 max-w-xl mx-auto leading-relaxed">
-                        We've successfully scored these articles. Click "Curate & Mint" to permanently log these findings on the blockchain and unlock the comprehensive deep-dive report.
+                        We've successfully scored these articles. Click "Curate & Mint" to permanently log these findings on the OneChain network and unlock the comprehensive deep-dive report.
                       </p>
 
                       {/* Unified Status Tracking */}
@@ -404,7 +374,7 @@ export default function ComparatorPage() {
                         {[
                           { label: "Database Sync", done: publishStep > 0, active: publishStep === 0 },
                           { label: "IPFS Pinning", done: publishStep > 1, active: publishStep === 1 },
-                          { label: "Blockchain Mint", done: publishStep === 3, active: publishStep === 2 },
+                          { label: "OneChain Mint", done: publishStep === 3, active: publishStep === 2 },
                         ].map((row, idx) => (
                           <div
                             key={idx}
@@ -428,17 +398,17 @@ export default function ComparatorPage() {
 
                       <Button
                         onClick={handleCurate}
-                        disabled={!isConnected || isPublishInProgress || isPublishing || isPublishConfirming}
+                        disabled={!account || isPublishInProgress}
                         size="lg"
                         className="px-10 py-4 shadow-lg shadow-emerald-500/20"
                       >
-                        {isPublishInProgress || isPublishing || isPublishConfirming ? (
+                        {isPublishInProgress ? (
                           <><Loader className="w-5 h-5 animate-spin mr-2" /> Minting Process...</>
                         ) : (
                           <><Link2 className="w-5 h-5 mr-2" /> Curate & Mint Report</>
                         )}
                       </Button>
-                      {!isConnected && <p className="text-xs text-zinc-500 mt-4">Connect wallet to unlock details</p>}
+                      {!account && <p className="text-xs text-zinc-500 mt-4">Connect OneWallet to unlock details</p>}
                     </div>
                   </Card>
                 )}
@@ -446,14 +416,12 @@ export default function ComparatorPage() {
                 {/* Full Details Revealed - Minted */}
                 {isFullyRevealed && (
                   <div className="space-y-8 animate-fade-in">
-                    {/* ... Rest of full breakdown UI ... */}
                     <Card className="p-8 border border-emerald-500/20 bg-zinc-900/40 backdrop-blur-md">
                       <div className="text-xs font-bold text-emerald-500 uppercase tracking-widest mb-3">Final Verdict</div>
                       <p className="text-white font-medium text-lg mb-3">{report.verdict.shortVerdict}</p>
                       <p className="text-zinc-400 text-sm leading-relaxed">{report.verdict.fullVerdict}</p>
                     </Card>
                     
-                    {/* Visual Placeholder for brevity - Assuming rest of the Dimension Breakdown matches original implementation */}
                     <Card variant="success" className="p-6 bg-emerald-500/5 border border-emerald-500/30 backdrop-blur-md">
                       <div className="flex items-center justify-between">
                         <div>
@@ -461,7 +429,7 @@ export default function ComparatorPage() {
                             <Hexagon className="w-4 h-4" /> Published On-Chain
                           </h3>
                           <p className="text-zinc-400 text-sm">
-                            On-chain ID: #{comparison.blockchainId} | IPFS: {comparison.ipfsHash?.substring(0, 20)}...
+                            Tx Digest: {comparison.blockchainId?.substring(0, 16)}... | IPFS: {comparison.ipfsHash?.substring(0, 20)}...
                           </p>
                         </div>
                         <div className="bg-emerald-500/20 px-4 py-2 rounded-xl font-bold text-emerald-400 text-sm shadow-inner">

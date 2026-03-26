@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState } from "react";
 import Navbar from "../components/Navbar";
 import Footer from "../components/Footer";
 import { Section } from "../components/Layout";
@@ -7,20 +7,16 @@ import BlockchainBackground from "../components/ui/BlockchainBackground";
 import { useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useArticleStore } from "../stores/articleStore";
-import {
-  useAccount,
-  useWriteContract,
-  useWaitForTransactionReceipt,
-  useChainId,
-  useSwitchChain,
-} from "wagmi";
-import { WRAPUP_ABI, CONTRACT_ADDRESSES } from "../wagmiConfig";
-import { decodeEventLog } from "viem";
 import axios from "axios";
 import {
   Search, X, Link2, Zap, Save, ArrowRight, ArrowLeft,
   CheckCircle, Circle, Loader
 } from "lucide-react";
+
+// --- OneChain / Sui Imports ---
+import { useCurrentAccount, useSuiClient, useSignAndExecuteTransaction } from '@mysten/dapp-kit';
+import { Transaction } from '@mysten/sui/transactions';
+import { PACKAGE_ID, CLOCK_ID } from "../constants"; 
 
 const API_BASE = "https://wrap-up-evolved.onrender.com/api";
 
@@ -36,21 +32,12 @@ export default function LegacyLandingPage() {
   const [txDone, setTxDone] = useState(false);
 
   const navigate = useNavigate();
-  const { isConnected, address } = useAccount();
-  const chainId = useChainId();
-  const { switchChain } = useSwitchChain();
   const { markArticleOnChainDB, deleteArticleFromDB } = useArticleStore();
 
-  const currentContractAddress = CONTRACT_ADDRESSES[chainId] || CONTRACT_ADDRESSES[421614];
-
-  const { data: hash, isPending, writeContract, error: writeError } = useWriteContract();
-  const {
-    data: receipt,
-    isLoading: isConfirming,
-    isSuccess: isConfirmed,
-    isError: isTxError,
-    error: txError,
-  } = useWaitForTransactionReceipt({ hash });
+  // --- OneChain Hooks ---
+  const account = useCurrentAccount();
+  const suiClient = useSuiClient();
+  const { mutateAsync: signAndExecuteTransaction } = useSignAndExecuteTransaction();
 
   const handleScrape = async (e) => {
     e.preventDefault();
@@ -78,11 +65,12 @@ export default function LegacyLandingPage() {
 
   const handleCurate = async () => {
     if (!scrapedPreview) return;
-    if (!isConnected) { toast.error("Connect wallet to curate"); return; }
+    if (!account) { toast.error("Connect OneWallet to curate"); return; }
 
     setLoading(true); setError(null); setTxDone(false);
 
     try {
+      // STEP 0: Save to DB
       setStepIndex(0);
       let dbArticle;
       try {
@@ -102,68 +90,93 @@ export default function LegacyLandingPage() {
         } else throw new Error(err.response?.data?.error || "DB save failed");
       }
 
+      // STEP 1: Upload to IPFS
       setStepIndex(1);
       const ipfsRes = await axios.post(`${API_BASE}/articles/upload-ipfs`, { ...scrapedPreview, id: dbArticle.id });
       const generatedHash = ipfsRes.data.ipfsHash;
       if (!generatedHash) throw new Error("IPFS upload failed");
       setIpfsHash(generatedHash);
 
+      // STEP 2: Mint on OneChain (Sui Move)
       setStepIndex(2);
-      const doWrite = () => writeContract({ address: currentContractAddress, abi: WRAPUP_ABI, functionName: "submitArticle", args: [generatedHash] });
-      
-      if (!CONTRACT_ADDRESSES[chainId]) switchChain({ chainId: 421614 }, { onSuccess: doWrite, onError: () => { toast.error("Network switch failed"); setLoading(false); } });
-      else doWrite();
+      toast.loading("Please sign the transaction in your wallet...", { id: "mintToast" });
+
+      // Find the user's UserProfile object ID required by the smart contract
+      const profileObjects = await suiClient.getOwnedObjects({
+        owner: account.address,
+        filter: { StructType: `${PACKAGE_ID}::platform::UserProfile` },
+      });
+
+      if (profileObjects.data.length === 0) {
+        throw new Error("You need to register a User Profile first! Please click 'Create Profile' in the Navbar.");
+      }
+
+      const userProfileId = profileObjects.data[0].data.objectId;
+
+      // Build the Programmable Transaction Block (PTB)
+      const tx = new Transaction();
+      tx.moveCall({
+        target: `${PACKAGE_ID}::platform::submit_ai_research`,
+        arguments: [
+          tx.object(userProfileId),
+          tx.pure.string(generatedHash),
+          tx.object(CLOCK_ID)
+        ],
+      });
+
+      // Execute the transaction
+      const result = await signAndExecuteTransaction({ 
+        transaction: tx 
+      });
+
+      toast.loading("Confirming on OneChain...", { id: "mintToast" });
+
+      // Wait for the network to confirm the transaction and fetch the generated events
+      const txDetails = await suiClient.waitForTransaction({
+        digest: result.digest,
+        options: { showEvents: true }
+      });
+
+      // Parse the event to get the newly created Report ID
+      let onChainId = null;
+      const event = txDetails.events?.find(e => e.type === `${PACKAGE_ID}::platform::ReportSubmittedEvent`);
+      if (event) {
+        onChainId = event.parsedJson.report_id;
+      }
+
+      // STEP 3: Sync On-Chain ID to DB
+      if (onChainId && account.address) {
+        await markArticleOnChainDB(savedArticle.articleUrl, onChainId, account.address, generatedHash);
+      }
+
+      setStepIndex(3); 
+      setTxDone(true); 
+      toast.success("Curated successfully on OneChain!", { id: "mintToast" }); 
+      setLoading(false);
+      setTimeout(() => navigate("/curated"), 2000);
 
     } catch (err) {
-      setError(err.message); toast.error(err.message || "Curation failed");
+      console.error(err);
+      setError(err.message); 
+      toast.error(err.message || "Curation failed", { id: "mintToast" });
       if (savedArticle?.id) { deleteArticleFromDB(savedArticle.id); setSavedArticle(null); }
-      setStepIndex(-1); setLoading(false);
+      setStepIndex(-1); 
+      setLoading(false);
     }
   };
-
-  useEffect(() => {
-    if (isPending) toast.loading("Waiting for wallet...", { id: "mintToast" });
-    if (isConfirming) { setStepIndex(2); toast.loading("Confirming on chain...", { id: "mintToast" }); }
-
-    if (isConfirmed && receipt && ipfsHash && savedArticle) {
-      let onChainId = null;
-      try {
-        for (const log of receipt.logs) {
-          const event = decodeEventLog({ abi: WRAPUP_ABI, data: log.data, topics: log.topics });
-          if (event.eventName === "ArticleSubmitted") { onChainId = event.args.articleId.toString(); break; }
-        }
-      } catch {}
-
-      if (onChainId && address) {
-        markArticleOnChainDB(savedArticle.articleUrl, onChainId, address, ipfsHash).then(() => {
-          setStepIndex(3); setTxDone(true); toast.success("Curated on-chain!", { id: "mintToast" }); setLoading(false);
-          setTimeout(() => navigate("/curated"), 2000);
-        }).catch((err) => { toast.error("DB sync failed", { id: "mintToast" }); setLoading(false); });
-      } else {
-        setStepIndex(3); setTxDone(true); toast.success("Minted!", { id: "mintToast" }); setLoading(false);
-        setTimeout(() => navigate("/curated"), 2000);
-      }
-    }
-
-    if (isTxError || writeError) {
-      toast.error("Transaction failed.", { id: "mintToast" });
-      if (savedArticle?.id) { deleteArticleFromDB(savedArticle.id); setSavedArticle(null); }
-      setStepIndex(-1); setLoading(false);
-    }
-  }, [isPending, isConfirming, isConfirmed, isTxError, receipt, writeError, txError, savedArticle, ipfsHash, address, navigate, markArticleOnChainDB, deleteArticleFromDB]);
 
   const handleReset = () => {
     setUrl(""); setScrapedPreview(null); setError(null);
     setSavedArticle(null); setIpfsHash(null); setTxDone(false); setStepIndex(-1);
   };
 
-  const isProcessing = loading || isPending || isConfirming;
+  const isProcessing = loading || stepIndex === 2;
 
   const getButtonLabel = () => {
     if (stepIndex === -1 && !loading) return "Curate & Mint";
     if (stepIndex === 0) return "Saving Database...";
     if (stepIndex === 1) return "Pinning to IPFS...";
-    if (stepIndex === 2 && (isPending || isConfirming)) return "Confirming on Chain...";
+    if (stepIndex === 2) return "Confirming on OneChain...";
     if (txDone) return "Successfully Minted!";
     return "Curate & Mint";
   };
@@ -172,7 +185,7 @@ export default function LegacyLandingPage() {
     { icon: Search, title: "Input", desc: "Paste any article URL." },
     { icon: Zap, title: "Process", desc: "AI extracts & summarizes insights." },
     { icon: Save, title: "Store", desc: "Saved to DB + IPFS." },
-    { icon: Link2, title: "Mint", desc: "Verifiable record on-chain." },
+    { icon: Link2, title: "Mint", desc: "Verifiable record on OneChain." },
   ];
 
   return (
@@ -207,7 +220,7 @@ export default function LegacyLandingPage() {
                 </span>
               </h1>
               <p className="text-zinc-400 text-lg md:text-xl max-w-2xl mx-auto leading-relaxed">
-                Paste a URL → AI summarizes → Saved to DB → Pinned to IPFS → Minted on-chain.
+                Paste a URL → AI summarizes → Saved to DB → Pinned to IPFS → Minted on OneChain.
               </p>
             </div>
 
@@ -330,14 +343,14 @@ export default function LegacyLandingPage() {
                   <div className="flex justify-end pt-6 border-t border-zinc-800/50">
                     <Button
                       onClick={handleCurate}
-                      disabled={isProcessing || txDone || !isConnected}
+                      disabled={isProcessing || txDone || !account}
                       size="lg"
                       className={`px-8 py-3.5 ${txDone ? "bg-emerald-500 hover:bg-emerald-500 text-black shadow-lg shadow-emerald-500/20 cursor-default" : "shadow-lg shadow-emerald-500/20"}`}
-                      variant={!isConnected ? "secondary" : "primary"}
+                      variant={!account ? "secondary" : "primary"}
                     >
                       {isProcessing && <Loader className="w-4 h-4 animate-spin mr-2" />}
-                      {!isConnected ? "Connect Wallet to Mint" : getButtonLabel()}
-                      {!isProcessing && !txDone && isConnected && <ArrowRight className="w-4 h-4 ml-2" />}
+                      {!account ? "Connect Wallet to Mint" : getButtonLabel()}
+                      {!isProcessing && !txDone && account && <ArrowRight className="w-4 h-4 ml-2" />}
                     </Button>
                   </div>
                 </div>

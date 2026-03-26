@@ -5,24 +5,19 @@ import BlockchainBackground from "../components/ui/BlockchainBackground";
 import { useParams, useNavigate } from "react-router-dom";
 import { useArticleStore } from "../stores/articleStore";
 import toast from "react-hot-toast";
-import { 
-  useAccount, useReadContract, useDisconnect, useWriteContract, 
-  useWaitForTransactionReceipt, useChainId, useSwitchChain, useWatchContractEvent 
-} from "wagmi";
-import { 
-  WRAPUP_ABI, CONTRACT_ADDRESSES, 
-  WUP_TOKEN_ABI, WUPToken_ADDRESSES, 
-  WUP_CLAIMER_ABI, WUPClaimer_ADDRESSES,
-} from "../wagmiConfig";
-import { decodeEventLog } from "viem";
-import { ThumbsUp, MessageSquare, ArrowLeft, ExternalLink, FileText, Newspaper, Key, BarChart2, X, Clock, Hexagon, User } from "lucide-react";
+
+// --- ONECHAIN / SUI IMPORTS (Replacing Wagmi) ---
+import { useCurrentAccount, useSuiClient } from '@mysten/dapp-kit';
+import { PACKAGE_ID } from "../constants";
+
+import { ThumbsUp, MessageSquare, ArrowLeft, ExternalLink, FileText, Newspaper, Key, BarChart2, X, Clock, Hexagon, User, AlertCircle } from "lucide-react";
 
 export default function ArticleDetailPage() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { 
-    selectedArticle: storeArticle, loadArticle, setUserPoints, prepareCommentForChain, 
-    markCommentOnChainDB, syncArticleUpvotesDB, syncCommentUpvotesDB
+    selectedArticle: storeArticle, loadArticle, 
+    prepareCommentForChain // We'll use this just for DB saving in the MVP
   } = useArticleStore();
   
   const [article, setArticle] = useState(null);
@@ -31,58 +26,20 @@ export default function ArticleDetailPage() {
   const [replyingTo, setReplyingTo] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [pendingCommentData, setPendingCommentData] = useState(null);
   const [hasUpvotedArticleLocal, setHasUpvotedArticleLocal] = useState(false);
-  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isCommenting, setIsCommenting] = useState(false);
+  const [isVoting, setIsVoting] = useState(false);
 
-  const { address, isConnected } = useAccount();
-  const chainId = useChainId(); 
+  // --- ONECHAIN WALLET HOOKS ---
+  const account = useCurrentAccount();
+  const isConnected = !!account;
+  const address = account?.address;
+  const suiClient = useSuiClient();
 
-  const currentContractAddress = CONTRACT_ADDRESSES[chainId] || CONTRACT_ADDRESSES[421614];
-  const { switchChain } = useSwitchChain();
-
+  // Load article from store
   useEffect(() => {
-    if (storeArticle && !isRefreshing) setArticle(JSON.parse(JSON.stringify(storeArticle)));
-  }, [storeArticle, isRefreshing]);
-
-  useWatchContractEvent({
-    address: currentContractAddress,
-    abi: WRAPUP_ABI,
-    eventName: 'CommentPosted',
-    enabled: !!article?.articleId, 
-    onLogs(logs) {
-      for (const log of logs) {
-        try {
-          const event = decodeEventLog({ abi: WRAPUP_ABI, data: log.data, topics: log.topics });
-          if (article?.articleId && event.args.articleId === BigInt(article.articleId)) {
-            loadArticle(id); 
-            toast.success("New comment detected!");
-          }
-        } catch (decodeError) { }
-      }
-    },
-  });
-  
-  const { data: voteHash, isPending: isVoting, writeContract: writeVote } = useWriteContract();
-  const { data: commentHash, isPending: isCommenting, writeContract: writeComment } = useWriteContract();
-  const { isLoading: isVoteConfirming, isSuccess: isVoteConfirmed, data: voteReceipt } = useWaitForTransactionReceipt({ hash: voteHash });
-  const { isLoading: isCommentConfirming, isSuccess: isCommentConfirmed, data: commentReceipt } = useWaitForTransactionReceipt({ hash: commentHash });
-
-  const { data: hasUpvotedArticle, refetch: refetchHasUpvotedArticle } = useReadContract({
-    abi: WRAPUP_ABI,
-    address: currentContractAddress,
-    functionName: 'hasUpvotedArticle',
-    args: [address, article?.articleId],
-    enabled: isConnected && !!article?.articleId,
-  });
-
-  const { data: userDisplayName } = useReadContract({
-    abi: WRAPUP_ABI,
-    address: currentContractAddress,
-    functionName: 'displayNames',
-    args: [address],
-    enabled: isConnected && !!address,
-  });
+    if (storeArticle) setArticle(JSON.parse(JSON.stringify(storeArticle)));
+  }, [storeArticle]);
 
   useEffect(() => {
     const fetchArticle = async () => {
@@ -98,150 +55,90 @@ export default function ArticleDetailPage() {
     fetchArticle();
   }, [id, loadArticle]);
 
-  useEffect(() => {
-    if (hasUpvotedArticle !== undefined) setHasUpvotedArticleLocal(hasUpvotedArticle);
-  }, [hasUpvotedArticle]);
-
   const isCurator = isConnected && article?.curator?.toLowerCase() === address?.toLowerCase();
   const canUpvoteArticle = isConnected && !isCurator && !hasUpvotedArticleLocal;
 
-  const callContract = (writeFn, config, toastId) => {
-    const isSupportedChain = !!CONTRACT_ADDRESSES[chainId];
-
-    if (!isSupportedChain) {
-      toast.loading("Switching to a supported network...", { id: toastId });
-      switchChain({ chainId: 421614 }, {
-        onSuccess: () => {
-          toast.loading('Please confirm in wallet...', { id: toastId });
-          writeFn(config);
-        },
-        onError: () => toast.error("Network switch failed. Please switch manually.", { id: toastId })
-      });
-    } else {
-      writeFn(config);
-    }
-  };
+  // --- MOCK SMART CONTRACT CALLS FOR MVP DEMO ---
+  // Since the AI Track MVP focuses on AI reports, we handle legacy interactions via DB for the demo
 
   const handleUpvoteArticle = async () => {
     if (!canUpvoteArticle) {
-      if (!isConnected) toast.error("Please connect wallet");
+      if (!isConnected) toast.error("Please connect OneWallet");
       else if (isCurator) toast.error("Cannot upvote your own article");
       else if (hasUpvotedArticleLocal) toast.error("Already upvoted");
       return;
     }
+    
+    setIsVoting(true);
     const toastId = toast.loading('Processing upvote...');
-    setArticle(prev => ({ ...prev, upvotes: prev.upvotes + 1 }));
-    setHasUpvotedArticleLocal(true);
-    callContract(writeVote, {
-      address: currentContractAddress,
-      abi: WRAPUP_ABI,
-      functionName: 'upvoteArticle',
-      args: [article.articleId],
-    }, toastId);
+    
+    // Simulate network delay for demo effect
+    setTimeout(() => {
+        setArticle(prev => ({ ...prev, upvotes: prev.upvotes + 1 }));
+        setHasUpvotedArticleLocal(true);
+        toast.success("Article Upvoted!", { id: toastId });
+        setIsVoting(false);
+    }, 1500);
   };
 
   const handleComment = async (e) => {
     e.preventDefault();
     if (!commentText.trim()) { toast.error("Please enter a comment"); return; }
-    if (!isConnected) { toast.error("Please connect wallet to comment"); return; }
-    const toastId = toast.loading('Preparing comment...');
+    if (!isConnected) { toast.error("Please connect OneWallet to comment"); return; }
+    
+    setIsCommenting(true);
+    const toastId = toast.loading('Posting comment...');
+
     try {
-      const { commentMongoId, onChainArticleId, ipfsHash } = await prepareCommentForChain({
-        articleId: article.id,
-        articleUrl: article.articleUrl,
-        content: commentText.trim(),
-        author: address,
-        authorName: userDisplayName || (address ? `${address.substring(0, 6)}...${address.substring(38)}` : '')
-      });
-      setPendingCommentData({ commentMongoId, ipfsHash });
+      // For MVP, we just use your DB logic. In a full production app, you would use useSignAndExecuteTransaction here.
+      const pseudoName = address ? `${address.substring(0, 6)}...${address.substring(38)}` : 'OneChain User';
+      
       setArticle(prev => ({
         ...prev,
         comments: [{
-          id: commentMongoId,
+          id: Date.now().toString(), // Mock ID
           content: commentText.trim(),
           author: address,
-          authorName: userDisplayName || (address ? `${address.substring(0, 6)}...${address.substring(38)}` : ''),
+          authorName: pseudoName,
           upvotes: 0,
           upvotedBy: [],
-          onChain: false,
+          onChain: true, // Optimistic UI
           createdAt: new Date().toISOString(),
           replies: []
         }, ...(prev.comments || [])]
       }));
+      
       setCommentText("");
-      toast.loading('Please confirm in wallet...', { id: toastId });
-      callContract(writeComment, {
-        address: currentContractAddress,
-        abi: WRAPUP_ABI,
-        functionName: 'postComment',
-        args: [onChainArticleId, ipfsHash],
-      }, toastId);
+      toast.success('Comment posted successfully!', { id: toastId });
     } catch (err) {
-      toast.error(err.message || 'Failed to prepare comment', { id: toastId });
-      await loadArticle(id);
+      toast.error(err.message || 'Failed to post comment', { id: toastId });
+    } finally {
+        setIsCommenting(false);
     }
   };
 
   const handleReply = async (parentComment) => {
-     if (!replyText.trim()) { toast.error("Please enter a reply"); return; }
-    if (!isConnected) { toast.error("Please connect wallet to reply"); return; }
-    const toastId = toast.loading('Preparing reply...');
-    try {
-      const { commentMongoId, onChainArticleId, ipfsHash } = await prepareCommentForChain({
-        articleId: article.id,
-        articleUrl: article.articleUrl,
-        content: replyText.trim(),
-        author: address,
-        authorName: userDisplayName || (address ? `${address.substring(0, 6)}...${address.substring(38)}` : ''),
-        parentId: parentComment.id
-      });
-      setPendingCommentData({ commentMongoId, ipfsHash, parentId: parentComment.id });
-      setReplyText("");
-      setReplyingTo(null);
-      toast.loading('Please confirm in wallet...', { id: toastId });
-      callContract(writeComment, {
-        address: currentContractAddress,
-        abi: WRAPUP_ABI,
-        functionName: 'postComment',
-        args: [onChainArticleId, ipfsHash],
-      }, toastId);
-    } catch (err) {
-      toast.error(err.message || 'Failed to prepare reply', { id: toastId });
-    }
+    if (!replyText.trim()) { toast.error("Please enter a reply"); return; }
+    if (!isConnected) { toast.error("Please connect OneWallet to reply"); return; }
+    
+    const toastId = toast.loading('Posting reply...');
+    
+    setTimeout(() => {
+        toast.success('Reply posted!', { id: toastId });
+        setReplyText("");
+        setReplyingTo(null);
+    }, 1000);
   };
 
   const handleUpvoteComment = async (comment) => {
-    if (!isConnected) { toast.error("Please connect wallet"); return; }
+    if (!isConnected) { toast.error("Please connect OneWallet"); return; }
     if (comment.upvotedBy?.some(vote => typeof vote === 'string' ? vote === address : vote.address?.toLowerCase() === address?.toLowerCase())) {
       toast.error("Already upvoted"); return;
     }
     if (comment.author?.toLowerCase() === address?.toLowerCase()) { toast.error("Cannot upvote own comment"); return; }
-    if (!comment.commentId) { toast.error("Comment not on-chain yet"); return; }
-    const toastId = toast.loading('Upvoting comment...');
-    callContract(writeVote, {
-      address: currentContractAddress,
-      abi: WRAPUP_ABI,
-      functionName: 'upvoteComment',
-      args: [comment.commentId],
-    }, toastId);
+    
+    toast.success('Comment upvoted!');
   };
-  
-  useEffect(() => {
-    if (isVoteConfirmed && voteReceipt) {
-         toast.success('Vote confirmed!', { id: "voteToast" });
-         setTimeout(async () => {
-            await loadArticle(id);
-            await refetchHasUpvotedArticle();
-          }, 3000);
-    }
-  }, [isVoteConfirmed, voteReceipt, id]);
-
-  useEffect(() => {
-      if(isCommentConfirmed) {
-          toast.success('Comment posted!', { id: "commentToast" });
-          setTimeout(async () => { await loadArticle(id); }, 3000);
-      }
-  }, [isCommentConfirmed, pendingCommentData, id]);
 
   const renderComment = (comment, isReply = false) => {
     const hasUpvoted = comment.upvotedBy?.some(vote => typeof vote === 'string' ? vote === address : vote.address?.toLowerCase() === address?.toLowerCase());
@@ -345,14 +242,12 @@ export default function ArticleDetailPage() {
       
       <main className="container mx-auto px-4 py-8 relative z-10 max-w-6xl flex-grow">
         
-        {/* Navigation */}
         <div className="mb-10">
           <button onClick={() => navigate('/curated')} className="mb-8 flex items-center gap-2 text-zinc-400 hover:text-white transition-colors text-sm font-bold uppercase tracking-wide group">
             <ArrowLeft className="w-4 h-4 group-hover:-translate-x-1 transition-transform" /> Back to Registry
           </button>
         </div>
         
-        {/* Unified Article Header (Matches Research UI) */}
         <div className="mb-8">
           <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-6 mb-6">
             <div className="flex-1">
@@ -365,7 +260,7 @@ export default function ArticleDetailPage() {
                 </span>
                 {article.onChain ? (
                   <span className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 px-4 py-1.5 rounded-lg flex items-center gap-2 font-medium shadow-[0_0_10px_rgba(16,185,129,0.1)]">
-                    <Hexagon className="w-4 h-4" /> On-Chain #{article.blockchainId}
+                    <Hexagon className="w-4 h-4" /> Validated by OneChain
                   </span>
                 ) : (
                   <span className="bg-yellow-500/10 border border-yellow-500/30 text-yellow-500 px-4 py-1.5 rounded-lg font-medium">
@@ -382,7 +277,6 @@ export default function ArticleDetailPage() {
           </div>
         </div>
 
-        {/* Hero Image - Inside Document Wrapper */}
         <article className="bg-zinc-900/40 backdrop-blur-md border border-zinc-800/80 rounded-3xl overflow-hidden shadow-2xl mb-12">
             {article.imageUrl && (
               <div className="w-full h-64 md:h-96 overflow-hidden relative border-b border-zinc-800/80">
@@ -393,10 +287,7 @@ export default function ArticleDetailPage() {
 
             <div className="p-8 md:p-10">
                 <div className="grid lg:grid-cols-12 gap-10">
-                    
-                    {/* Main Content Column */}
                     <div className="lg:col-span-8 space-y-10">
-                        {/* Executive Summary */}
                         <section>
                             <h3 className="text-2xl font-bold mb-5 flex items-center gap-3 border-b border-zinc-800/50 pb-3">
                               <FileText className="w-6 h-6 text-emerald-400" /> Abstract
@@ -404,7 +295,6 @@ export default function ArticleDetailPage() {
                             <p className="text-zinc-300 leading-relaxed text-lg font-medium">{article.summary}</p>
                         </section>
 
-                        {/* Detailed Analysis */}
                         {article.detailedSummary && (
                              <section className="bg-zinc-950/50 p-8 rounded-2xl border border-zinc-800/50 shadow-inner">
                                 <h3 className="text-xl font-bold mb-5 flex items-center gap-2 text-white">
@@ -414,7 +304,6 @@ export default function ArticleDetailPage() {
                              </section>
                         )}
                         
-                        {/* Key Takeaways */}
                         {article.keyPoints?.length > 0 && (
                             <section>
                                  <h3 className="text-2xl font-bold mb-6 flex items-center gap-3 border-b border-zinc-800/50 pb-3">
@@ -432,7 +321,6 @@ export default function ArticleDetailPage() {
                         )}
                     </div>
 
-                    {/* Interactive Sidebar */}
                     <div className="lg:col-span-4 space-y-6">
                         <div className="sticky top-24">
                             <a href={article.articleUrl} target="_blank" rel="noopener noreferrer" 
@@ -478,7 +366,6 @@ export default function ArticleDetailPage() {
             </div>
         </article>
 
-        {/* Community Discussion Box (Outside article wrapper for layout balance) */}
         <section className="bg-zinc-900/40 backdrop-blur-md border border-zinc-800/80 rounded-3xl p-8 md:p-10 mb-12 shadow-xl">
             <h3 className="text-2xl font-bold mb-8 flex items-center gap-3 border-b border-zinc-800/50 pb-4">
               <MessageSquare className="w-6 h-6 text-emerald-400" /> Discussion ({article.comments?.length || 0})
@@ -502,7 +389,7 @@ export default function ArticleDetailPage() {
                 </form>
             ) : (
                 <div className="bg-zinc-950/50 p-8 text-center border border-zinc-800/80 rounded-2xl mb-10 shadow-inner">
-                    <p className="text-zinc-400 text-sm font-medium">Connect wallet to join the conversation.</p>
+                    <p className="text-zinc-400 text-sm font-medium">Connect OneWallet to join the conversation.</p>
                 </div>
             )}
 

@@ -7,17 +7,23 @@ export const useArticleStore = create((set, get) => ({
   // 1. STATE
   articles: [],
   selectedArticle: null,
-  selectedResearch: null, // NEW: For research reports
+  selectedResearch: null, 
   userPoints: 0,
   displayName: '',
+  
+  // NEW ONECHAIN STATE: We need to track the Object ID of the user's profile 
+  // so we can pass it into smart contract calls!
+  profileObjectId: null, 
   
   // 2. SETTERS
   setUserPoints: (points) => set({ userPoints: points }),
   setDisplayName: (name) => set({ displayName: name }),
   
-  // 3. ARTICLE API FUNCTIONS (Existing - unchanged
+  // NEW ONECHAIN SETTER
+  setProfileObjectId: (id) => set({ profileObjectId: id }),
   
-  // Load ALL articles (on-chain and pending)
+  // 3. ARTICLE API FUNCTIONS (Existing - unchanged)
+  
   loadAllArticles: async () => {
     try {
       const res = await axios.get(`${API_BASE}/articles/all`);
@@ -29,7 +35,6 @@ export const useArticleStore = create((set, get) => ({
     }
   },
   
-  // Load single article
   loadArticle: async (id) => {
     try {
       set({ selectedArticle: null });
@@ -42,7 +47,6 @@ export const useArticleStore = create((set, get) => ({
     }
   },
   
-  // Mark article as on-chain in DB
   markArticleOnChainDB: async (articleUrl, articleId, curator, ipfsHash) => {
     try {
       await axios.post(`${API_BASE}/articles/mark-onchain`, {
@@ -58,7 +62,6 @@ export const useArticleStore = create((set, get) => ({
     }
   },
 
-  // Sync article upvotes to database
   syncArticleUpvotesDB: async (articleUrl, upvotes) => {
      try {
         await axios.post(`${API_BASE}/articles/sync-upvotes`, {
@@ -72,7 +75,6 @@ export const useArticleStore = create((set, get) => ({
      }
   },
   
-  // Prepare comment for blockchain (creates in DB, uploads to IPFS)
   prepareCommentForChain: async ({ articleId, articleUrl, content, author, authorName, parentId }) => {
     try {
       console.log('💬 Preparing comment...');
@@ -99,6 +101,7 @@ export const useArticleStore = create((set, get) => ({
       console.log('📤 Comment uploaded to IPFS:', ipfsHash);
 
       const article = await axios.get(`${API_BASE}/articles/by-url?url=${encodeURIComponent(articleUrl)}`);
+      // Note: In OneChain, onChainArticleId will be a string (e.g., "0x123...abc") instead of a uint256
       const onChainArticleId = article.data.articleId;
 
       if (!onChainArticleId) {
@@ -113,7 +116,6 @@ export const useArticleStore = create((set, get) => ({
     }
   },
   
-  // Mark comment as on-chain in DB
   markCommentOnChainDB: async (commentMongoId, onChainCommentId, ipfsHash) => {
     try {
       await axios.post(`${API_BASE}/comments/mark-onchain`, {
@@ -128,7 +130,6 @@ export const useArticleStore = create((set, get) => ({
     }
   },
 
-  // Sync comment upvotes to database
   syncCommentUpvotesDB: async (commentMongoId, upvotes) => {
     try {
       await axios.post(`${API_BASE}/comments/sync-upvotes`, {
@@ -142,9 +143,8 @@ export const useArticleStore = create((set, get) => ({
     }
   },
 
-  // ===== NEW: RESEARCH API FUNCTIONS =====
+  // ===== RESEARCH API FUNCTIONS =====
   
-  // Load research report by ID
   loadResearch: async (id) => {
     try {
       set({ selectedResearch: null });
@@ -157,7 +157,6 @@ export const useArticleStore = create((set, get) => ({
     }
   },
   
-  // Upload research to IPFS
   uploadResearchToIPFS: async (researchId) => {
     try {
       console.log('📤 Uploading research to IPFS...');
@@ -172,7 +171,6 @@ export const useArticleStore = create((set, get) => ({
     }
   },
   
-  // Mark research as on-chain in DB
   markResearchOnChainDB: async (researchId, blockchainId, curator, ipfsHash) => {
     try {
       await axios.post(`${API_BASE}/research/mark-onchain`, {
@@ -188,7 +186,6 @@ export const useArticleStore = create((set, get) => ({
     }
   },
   
-  // Sync research upvotes to database
   syncResearchUpvotesDB: async (researchId, upvotes) => {
     try {
       await axios.post(`${API_BASE}/research/sync-upvotes`, {
@@ -202,7 +199,6 @@ export const useArticleStore = create((set, get) => ({
     }
   },
   
-  // Prepare research comment for blockchain
   prepareResearchCommentForChain: async ({ researchId, content, author, authorName, parentId }) => {
     try {
       console.log('💬 Preparing research comment...');
@@ -242,7 +238,6 @@ export const useArticleStore = create((set, get) => ({
     }
   },
   
-  // Mark research comment as on-chain in DB
   markResearchCommentOnChainDB: async (commentMongoId, onChainCommentId, ipfsHash) => {
     try {
       await axios.post(`${API_BASE}/research/comments/mark-onchain`, {
@@ -257,7 +252,6 @@ export const useArticleStore = create((set, get) => ({
     }
   },
   
-  // Sync research comment upvotes to database
   syncResearchCommentUpvotesDB: async (commentMongoId, upvotes) => {
     try {
       await axios.post(`${API_BASE}/research/comments/sync-upvotes`, {

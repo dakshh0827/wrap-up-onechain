@@ -1,11 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useArticleStore } from "../stores/articleStore";
-import { useWeb3Modal } from '@web3modal/wagmi/react';
-import { useAccount, useReadContract, useDisconnect, useWriteContract, useWaitForTransactionReceipt, useChainId } from "wagmi";
-import { 
-  WUP_CLAIMER_ABI, CONTRACT_ADDRESSES, WRAPUP_ABI, WUPToken_ADDRESSES, WUP_TOKEN_ABI, WUPClaimer_ADDRESSES,
-} from "../wagmiConfig";
 import toast from "react-hot-toast";
 import axios from "axios";
 import { 
@@ -13,16 +8,31 @@ import {
   Brain, FileText, LogOut, Wallet, Link2, Scale, Hexagon, ChevronDown, Zap
 } from "lucide-react";
 
+// --- OneChain / Sui Imports ---
+import { 
+  ConnectButton, 
+  useCurrentAccount, 
+  useDisconnectWallet, 
+  useSuiClientQuery, 
+  useSignAndExecuteTransaction 
+} from '@mysten/dapp-kit';
+import { Transaction } from '@mysten/sui/transactions';
+import { PACKAGE_ID } from "../constants";
+
 const API_BASE = 'https://wrap-up-evolved.onrender.com/api';
 
 export default function Navbar() {
-  const { userPoints, displayName, setUserPoints, setDisplayName } = useArticleStore();
-  const [newName, setNewName] = useState("");
+  const { userPoints, displayName, setUserPoints, setDisplayName, setProfileObjectId } = useArticleStore();  const [newName, setNewName] = useState("");
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [savingToDb, setSavingToDb] = useState(false);
   const [isScrolled, setIsScrolled] = useState(false);
   const [isToolsOpen, setIsToolsOpen] = useState(false);
   const [isRewardsOpen, setIsRewardsOpen] = useState(false);
+
+  // Sui State
+  const [userProfileId, setUserProfileId] = useState(null);
+  const [claimablePoints, setClaimablePoints] = useState(0);
+  const [wupBalance, setWupBalance] = useState(0);
 
   const toolsCloseTimer = useRef(null);
   const rewardsCloseTimer = useRef(null);
@@ -31,14 +41,12 @@ export default function Navbar() {
   const navigate = useNavigate();
   const isActive = (path) => location.pathname === path;
    
-  const { address, isConnected } = useAccount();
-  const { disconnect } = useDisconnect();
-  const chainId = useChainId();
-
-  const currentContractAddress = CONTRACT_ADDRESSES[chainId] || CONTRACT_ADDRESSES[421614];
-  const currentTokenAddress = WUPToken_ADDRESSES[chainId] || WUPToken_ADDRESSES[421614];
-  const currentClaimerAddress = WUPClaimer_ADDRESSES[chainId] || WUPClaimer_ADDRESSES[421614];
-  const { open } = useWeb3Modal();
+  // OneChain Wallet Hooks
+  const account = useCurrentAccount();
+  const isConnected = !!account;
+  const address = account?.address;
+  const { mutate: disconnect } = useDisconnectWallet();
+  const { mutate: signAndExecuteTransaction, isPending: isClaiming } = useSignAndExecuteTransaction();
 
   useEffect(() => {
     const handleScroll = () => setIsScrolled(window.scrollY > 20);
@@ -46,195 +54,137 @@ export default function Navbar() {
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
-  const { data: pointsData, refetch: refetchPoints } = useReadContract({
-    abi: WRAPUP_ABI,
-    address: currentContractAddress,
-    functionName: 'getUserPoints',
-    args: [address],
-    enabled: isConnected && !!address,
+  // --- Read Blockchain State (The Move Way) ---
+  // Fetch the UserProfile object owned by the connected wallet
+  const { data: profileObjects, refetch: refetchProfile } = useSuiClientQuery('getOwnedObjects', {
+    owner: address,
+    filter: { StructType: `${PACKAGE_ID}::platform::UserProfile` },
+    options: { showContent: true },
+  }, {
+    enabled: isConnected,
+    refetchInterval: 5000, // Auto-refresh every 5s
   });
-
-  const { data: nameData, refetch: refetchName } = useReadContract({
-    abi: WRAPUP_ABI,
-    address: currentContractAddress,
-    functionName: 'displayNames',
-    args: [address],
-    enabled: isConnected && !!address,
-  });
-
-  const { data: wupBalance, refetch: refetchWupBalance } = useReadContract({
-    address: currentTokenAddress,
-    abi: WUP_TOKEN_ABI,
-    functionName: 'balanceOf',
-    args: [address],
-    enabled: isConnected && !!address && !!currentTokenAddress,  
-  });
-
-  const { data: claimedPointsData, refetch: refetchClaimedPoints } = useReadContract({
-    address: currentClaimerAddress,
-    abi: WUP_CLAIMER_ABI,
-    functionName: 'claimedPoints',
-    args: [address],
-    enabled: isConnected && !!address,
-  });
-  
-  const claimablePoints = (userPoints || 0) - (Number(claimedPointsData) || 0);
-
-  const { data: hash, isPending, writeContract, error: writeError, isError: isWriteError } = useWriteContract();
-
-  const { 
-    isLoading: isConfirming, 
-    isSuccess: isConfirmed, 
-    error: receiptError, 
-    isError: isReceiptError 
-  } = useWaitForTransactionReceipt({ hash });
-
-  const {
-    data: claimHash,
-    isPending: isClaiming,
-    writeContract: claimRewards,
-  } = useWriteContract();
-
-  const { isLoading: isConfirmingClaim, isSuccess: isClaimConfirmed } =
-    useWaitForTransactionReceipt({ hash: claimHash });
 
   useEffect(() => {
     if (isConnected && address) {
-      refetchPoints();
-      refetchName();
-      refetchWupBalance();
-      refetchClaimedPoints();
       fetchUserFromDb(address);
     } else {
       setUserPoints(0);
       setDisplayName('');
+      setClaimablePoints(0);
+      setWupBalance(0);
+      setUserProfileId(null);
     }
-  }, [isConnected, address, refetchPoints, refetchName, refetchWupBalance, refetchClaimedPoints, setUserPoints, setDisplayName]);
+  }, [isConnected, address]);
 
+  // Parse the UserProfile object when it loads
   useEffect(() => {
-    if (pointsData !== undefined) {
-      setUserPoints(Number(pointsData));
+    if (profileObjects && profileObjects.data.length > 0) {
+      const profileData = profileObjects.data[0].data.content.fields;
+      
+      setUserProfileId(profileObjects.data[0].data.objectId);
+      setProfileObjectId(profileObjects.data[0].data.objectId); // <--- ADD THIS
+      
+      const total = Number(profileData.total_points);
+      const claimed = Number(profileData.claimed_points);
+      
+      setUserPoints(total);
+      setClaimablePoints(total - claimed);
+      
+      // Simulate WUP Balance (1 point = 10 WUP based on EVM logic)
+      setWupBalance(claimed * 10);
+    } else {
+      // User doesn't have a profile object yet
+      setUserProfileId(null);
+      setProfileObjectId(null); // <--- ADD THIS
+      setUserPoints(0);
+      setClaimablePoints(0);
+      setWupBalance(0);
     }
-  }, [pointsData, setUserPoints]);
+  }, [profileObjects]);
 
-  useEffect(() => {
-    if (nameData) {
-      setDisplayName(nameData);
-    }
-  }, [nameData, setDisplayName]);
-
+  // --- Database Logic ---
   const fetchUserFromDb = async (walletAddress) => {
     try {
       const response = await axios.get(`${API_BASE}/users/${walletAddress}`);
       if (response.data && response.data.displayName) {
-        if (!nameData) {
-          setDisplayName(response.data.displayName);
-        }
+        setDisplayName(response.data.displayName);
       }
     } catch (error) {
       console.log('User not found in DB or error:', error.message);
     }
   };
 
-  const saveDisplayNameToDb = async (name, walletAddress) => {
+  const handleSetDisplayName = async () => {
+    if (!newName.trim()) return toast.error("Name cannot be empty");
+    if (newName.trim().length > 32) return toast.error("Name must be 1-32 characters");
+
     try {
       setSavingToDb(true);
+      toast.loading("Saving to database...", { id: "setNameToast" });
       const response = await axios.post(`${API_BASE}/users/set-display-name`, {
-        walletAddress,
-        displayName: name
+        walletAddress: address,
+        displayName: newName.trim()
       });
-      if (response.data.success) return true;
-      return false;
+      
+      if (response.data.success) {
+        toast.success("Name saved!", { id: "setNameToast" });
+        setDisplayName(newName.trim());
+        setNewName("");
+      } else {
+        throw new Error("Failed to save");
+      }
     } catch (error) {
-      console.error('Failed to save display name to database:', error);
-      return false;
+      toast.error("Failed to save to database", { id: "setNameToast" });
     } finally {
       setSavingToDb(false);
     }
   };
 
-  useEffect(() => {
-    if (isConfirming) {
-      toast.loading("Setting name on blockchain...", { id: "setNameToast" });
-    }
-    if (isConfirmed) {
-      toast.success("Name saved on blockchain successfully!", { id: "setNameToast" });
-      setDisplayName(newName);
-      setNewName("");
-      refetchName();
-    }
-    if (isWriteError || isReceiptError) {
-      const errorMsg = writeError?.shortMessage || receiptError?.shortMessage || "Transaction failed";
-      toast.error(`Blockchain Error: ${errorMsg}`, { id: "setNameToast" });
-    }
-  }, [isConfirming, isConfirmed, isWriteError, writeError, isReceiptError, receiptError]);
+  // --- Write Blockchain Logic (Transactions) ---
+  const handleRegisterProfile = () => {
+    const tx = new Transaction();
+    tx.moveCall({
+      target: `${PACKAGE_ID}::platform::register_user`,
+      arguments: [],
+    });
 
-  const handleClaim = async () => {
-    if (!currentClaimerAddress) {
-      toast.error('Claiming is not supported on this network!');
-      return;
-    }
-    if (claimablePoints <= 0) {
-      toast.error('You have no points to claim!');
-      return;
-    }
+    toast.loading("Creating on-chain profile...", { id: "register" });
+    signAndExecuteTransaction({ transaction: tx }, {
+      onSuccess: () => {
+        toast.success("Profile created! You can now earn points.", { id: "register" });
+        refetchProfile();
+      },
+      onError: (err) => {
+        toast.error(`Failed: ${err.message}`, { id: "register" });
+      }
+    });
+  };
+
+  const handleClaim = () => {
+    if (!userProfileId) return toast.error("Please register your profile first.");
+    if (claimablePoints <= 0) return toast.error('You have no points to claim!');
     
-    toast.loading('Confirm in your wallet...', { id: 'claim_toast' });
-    claimRewards({
-      address: currentClaimerAddress,
-      abi: WUP_CLAIMER_ABI,
-      functionName: 'claimReward',
-      args: [],
+    const tx = new Transaction();
+    tx.moveCall({
+      target: `${PACKAGE_ID}::platform::claim_rewards`,
+      arguments: [tx.object(userProfileId)],
+    });
+
+    toast.loading('Confirming claim...', { id: 'claim_toast' });
+    signAndExecuteTransaction({ transaction: tx }, {
+      onSuccess: () => {
+        toast.success('Tokens Claimed!', { id: 'claim_toast' });
+        refetchProfile(); // Instantly update UI balances
+      },
+      onError: (err) => toast.error(`Claim failed: ${err.message}`, { id: 'claim_toast' })
     });
   };
 
-  useEffect(() => {
-    if (isConfirmingClaim) toast.loading('Claiming tokens...', { id: 'claim_toast' });
-    if (isClaimConfirmed) {
-      toast.success('Tokens Claimed!', { id: 'claim_toast' });
-      refetchWupBalance();
-      refetchClaimedPoints();
-      refetchPoints();
-    }
-  }, [isConfirmingClaim, isClaimConfirmed, refetchWupBalance, refetchClaimedPoints, refetchPoints]);
-
-  const handleWalletAction = () => {
-    if (isConnected) disconnect();
-    else open(); 
-  };
-
-  const handleSetDisplayName = async () => {
-    if (!newName.trim()) {
-      toast.error("Name cannot be empty");
-      return;
-    }
-    if (newName.trim().length > 32) {
-      toast.error("Name must be 1-32 characters");
-      return;
-    }
-
-    toast.loading("Saving to database...", { id: "setNameToast" });
-    const dbSaved = await saveDisplayNameToDb(newName.trim(), address);
-
-    if (!dbSaved) {
-      toast.error("Failed to save to database. Transaction aborted.", { id: "setNameToast" });
-      return;
-    }
-
-    toast.loading("Database updated! Confirm in wallet...", { id: "setNameToast" });
-    writeContract({
-      address: currentContractAddress,
-      abi: WRAPUP_ABI,
-      functionName: 'setDisplayName',
-      args: [newName.trim()],
-    });
-  };
-
-  const isClaimButtonDisabled = isClaiming || isConfirmingClaim || claimablePoints <= 0;
-   
+  const isClaimButtonDisabled = isClaiming || claimablePoints <= 0 || !userProfileId;
   const claimButtonText = () => {
-    if (isClaiming) return 'Check Wallet...';
-    if (isConfirmingClaim) return 'Confirming...';
+    if (isClaiming) return 'Claiming...';
+    if (!userProfileId) return 'Register Profile First';
     if (claimablePoints <= 0) return 'No Points';
     return 'Claim $WUP';
   };
@@ -250,7 +200,6 @@ export default function Navbar() {
     { path: '/research-list', label: 'Reports', icon: Hexagon },
   ];
 
-  // Hover helpers with delay to prevent accidental close
   const handleToolsEnter = () => {
     if (toolsCloseTimer.current) clearTimeout(toolsCloseTimer.current);
     setIsToolsOpen(true);
@@ -296,13 +245,8 @@ export default function Navbar() {
 
           {/* Desktop Navigation */}
           <div className="hidden lg:flex items-center gap-2 relative">
-  
             {/* Tools Dropdown */}
-            <div
-              className="relative"
-              onMouseEnter={handleToolsEnter}
-              onMouseLeave={handleToolsLeave}
-            >
+            <div className="relative" onMouseEnter={handleToolsEnter} onMouseLeave={handleToolsLeave}>
               <button className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all ${
                 isToolsOpen ? 'text-white bg-zinc-800/50' : 'text-zinc-400 hover:text-white hover:bg-zinc-800/50'
               }`}>
@@ -317,7 +261,6 @@ export default function Navbar() {
                   onMouseEnter={handleToolsEnter}
                   onMouseLeave={handleToolsLeave}
                 >
-                  {/* invisible bridge to prevent gap-triggered close */}
                   <div className="absolute -top-1 left-0 right-0 h-2" />
                   {toolLinks.map(({ path, label, icon: Icon }) => (
                     <Link
@@ -334,7 +277,6 @@ export default function Navbar() {
               )}
             </div>
 
-            {/* Other Nav Links */}
             {navLinks.map(({ path, label, icon: Icon }) => (
               <Link
                 key={path}
@@ -355,72 +297,72 @@ export default function Navbar() {
           <div className="hidden lg:flex items-center gap-3">
             {isConnected && (
               <>
-                {/* Earnings Dropdown */}
-                <div
-                  className="relative"
-                  onMouseEnter={handleRewardsEnter}
-                  onMouseLeave={handleRewardsLeave}
-                >
-                  <button className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-all duration-200 border ${
-                    claimablePoints > 0
-                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20'
-                      : 'bg-zinc-900 border-zinc-800 text-zinc-300 hover:border-zinc-600'
-                  }`}>
-                    <Zap className={`w-4 h-4 ${claimablePoints > 0 ? 'text-emerald-400' : 'text-zinc-500'}`} />
-                    Earnings
-                    <ChevronDown className={`w-3 h-3 transition-transform duration-200 ${isRewardsOpen ? 'rotate-180' : ''}`} />
+                {/* Registration Reminder */}
+                {!userProfileId && (
+                  <button 
+                    onClick={handleRegisterProfile}
+                    className="bg-emerald-500/20 border border-emerald-500/50 text-emerald-400 px-4 py-2 rounded-xl text-sm font-bold hover:bg-emerald-500/30 transition-all animate-pulse"
+                  >
+                    Init Profile
                   </button>
+                )}
 
-                  {isRewardsOpen && (
-                    <div
-                      className="absolute top-full right-0 w-60 bg-zinc-950 border border-zinc-800 rounded-2xl shadow-xl z-50 overflow-hidden"
-                      style={{ marginTop: '4px' }}
-                      onMouseEnter={handleRewardsEnter}
-                      onMouseLeave={handleRewardsLeave}
-                    >
-                      {/* invisible bridge */}
-                      <div className="absolute -top-1 left-0 right-0 h-2" />
-                      <div className="p-3 space-y-1">
-                        <div className="flex items-center justify-between px-3 py-2.5 rounded-xl bg-zinc-900">
-                          <div className="flex items-center gap-2 text-zinc-400 text-xs uppercase tracking-wide">
-                            <Star className="w-3.5 h-3.5 text-emerald-500" />
-                            Total Points
+                {/* Earnings Dropdown */}
+                {userProfileId && (
+                  <div className="relative" onMouseEnter={handleRewardsEnter} onMouseLeave={handleRewardsLeave}>
+                    <button className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-all duration-200 border ${
+                      claimablePoints > 0
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20'
+                        : 'bg-zinc-900 border-zinc-800 text-zinc-300 hover:border-zinc-600'
+                    }`}>
+                      <Zap className={`w-4 h-4 ${claimablePoints > 0 ? 'text-emerald-400' : 'text-zinc-500'}`} />
+                      Earnings
+                      <ChevronDown className={`w-3 h-3 transition-transform duration-200 ${isRewardsOpen ? 'rotate-180' : ''}`} />
+                    </button>
+
+                    {isRewardsOpen && (
+                      <div className="absolute top-full right-0 w-60 bg-zinc-950 border border-zinc-800 rounded-2xl shadow-xl z-50 overflow-hidden" style={{ marginTop: '4px' }}>
+                        <div className="absolute -top-1 left-0 right-0 h-2" />
+                        <div className="p-3 space-y-1">
+                          <div className="flex items-center justify-between px-3 py-2.5 rounded-xl bg-zinc-900">
+                            <div className="flex items-center gap-2 text-zinc-400 text-xs uppercase tracking-wide">
+                              <Star className="w-3.5 h-3.5 text-emerald-500" />
+                              Total Points
+                            </div>
+                            <span className="text-white font-bold text-sm">{userPoints}</span>
                           </div>
-                          <span className="text-white font-bold text-sm">{userPoints}</span>
+
+                          <div className="flex items-center justify-between px-3 py-2.5 rounded-xl bg-zinc-900">
+                            <div className="flex items-center gap-2 text-zinc-400 text-xs uppercase tracking-wide">
+                              <Award className="w-3.5 h-3.5 text-emerald-500" />
+                              $WUP Balance
+                            </div>
+                            <span className="text-white font-bold text-sm">{wupBalance.toFixed(2)}</span>
+                          </div>
+
+                          {claimablePoints > 0 && (
+                            <div className="flex items-center justify-between px-3 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
+                              <span className="text-emerald-400 text-xs uppercase tracking-wide font-medium">Claimable</span>
+                              <span className="text-emerald-400 font-bold text-sm">{claimablePoints} pts</span>
+                            </div>
+                          )}
+
+                          <button
+                            onClick={handleClaim}
+                            disabled={isClaimButtonDisabled}
+                            className={`w-full mt-1 py-2.5 rounded-xl text-sm font-bold uppercase tracking-wide transition-all duration-200 ${
+                              isClaimButtonDisabled
+                                ? 'bg-zinc-800 text-zinc-600 cursor-not-allowed'
+                                : 'bg-emerald-500 text-black hover:bg-emerald-400 shadow-lg shadow-emerald-500/20'
+                            }`}
+                          >
+                            {claimButtonText()}
+                          </button>
                         </div>
-
-                        <div className="flex items-center justify-between px-3 py-2.5 rounded-xl bg-zinc-900">
-                          <div className="flex items-center gap-2 text-zinc-400 text-xs uppercase tracking-wide">
-                            <Award className="w-3.5 h-3.5 text-emerald-500" />
-                            $WUP Balance
-                          </div>
-                          <span className="text-white font-bold text-sm">
-                            {wupBalance !== undefined ? (Number(wupBalance) / 1e18).toFixed(2) : '0.00'}
-                          </span>
-                        </div>
-
-                        {claimablePoints > 0 && (
-                          <div className="flex items-center justify-between px-3 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
-                            <span className="text-emerald-400 text-xs uppercase tracking-wide font-medium">Claimable</span>
-                            <span className="text-emerald-400 font-bold text-sm">{claimablePoints} pts</span>
-                          </div>
-                        )}
-
-                        <button
-                          onClick={handleClaim}
-                          disabled={isClaimButtonDisabled}
-                          className={`w-full mt-1 py-2.5 rounded-xl text-sm font-bold uppercase tracking-wide transition-all duration-200 ${
-                            isClaimButtonDisabled
-                              ? 'bg-zinc-800 text-zinc-600 cursor-not-allowed'
-                              : 'bg-emerald-500 text-black hover:bg-emerald-400 shadow-lg shadow-emerald-500/20'
-                          }`}
-                        >
-                          {claimButtonText()}
-                        </button>
                       </div>
-                    </div>
-                  )}
-                </div>
+                    )}
+                  </div>
+                )}
 
                 {/* Display Name */}
                 {displayName ? (
@@ -437,43 +379,23 @@ export default function Navbar() {
                       onChange={(e) => setNewName(e.target.value)}
                       onKeyDown={(e) => e.key === 'Enter' && handleSetDisplayName()}
                       className="px-4 py-2 rounded-xl bg-zinc-900 border border-zinc-800 text-white placeholder-zinc-600 focus:outline-none focus:border-emerald-500/50 text-sm w-28"
-                      disabled={isPending || isConfirming || savingToDb}
+                      disabled={savingToDb}
                     />
                     <button
                       onClick={handleSetDisplayName}
-                      disabled={isPending || isConfirming || savingToDb}
+                      disabled={savingToDb}
                       className="bg-zinc-800 hover:bg-zinc-700 px-3 py-2 rounded-xl text-white transition-colors"
                     >
                       <Check className="w-4 h-4" />
                     </button>
                   </div>
                 )}
-
-                <w3m-network-button />
               </>
             )}
             
-            {/* Wallet Button */}
-            <button
-              onClick={handleWalletAction}
-              className={`px-5 py-2.5 rounded-xl text-sm font-bold transition-all duration-200 flex items-center gap-2 ${
-                isConnected
-                  ? 'bg-zinc-900 border border-zinc-800 text-white hover:border-red-500/50 hover:text-red-400' 
-                  : 'bg-white text-black hover:bg-emerald-400'
-              }`}
-            >
-              {isConnected ? (
-                <>
-                  <Wallet className="w-4 h-4" />
-                  {`${address.substring(0, 6)}...${address.substring(address.length - 4)}`}
-                </>
-              ) : (
-                <>
-                  <Wallet className="w-4 h-4" />
-                  Connect
-                </>
-              )}
-            </button>
+            {/* Standard Mysten Dapp Kit Connect Button */}
+            <ConnectButton className="!bg-white !text-black !font-bold hover:!bg-emerald-400 !px-5 !py-2.5 !rounded-xl !transition-all !duration-200" />
+            
           </div>
         </div>
 
@@ -509,30 +431,39 @@ export default function Navbar() {
             
             {isConnected && (
               <div className="space-y-3 pt-4 border-t border-zinc-800">
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="bg-zinc-900 p-4 rounded-xl border border-zinc-800 flex items-center justify-between">
-                    <span className="text-zinc-500 text-xs uppercase">Points</span>
-                    <span className="text-emerald-400 font-bold">{userPoints}</span>
-                  </div>
-                  <div className="bg-zinc-900 p-4 rounded-xl border border-zinc-800 flex items-center justify-between">
-                    <span className="text-zinc-500 text-xs uppercase">$WUP</span>
-                    <span className="text-emerald-400 font-bold">
-                      {wupBalance !== undefined ? (Number(wupBalance) / 1e18).toFixed(2) : '0.00'}
-                    </span>
-                  </div>
-                </div>
+                {!userProfileId ? (
+                   <button 
+                   onClick={handleRegisterProfile}
+                   className="w-full bg-emerald-500/20 border border-emerald-500/50 text-emerald-400 py-3 rounded-xl text-sm font-bold hover:bg-emerald-500/30 transition-all"
+                 >
+                   Init Profile First
+                 </button>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="bg-zinc-900 p-4 rounded-xl border border-zinc-800 flex items-center justify-between">
+                        <span className="text-zinc-500 text-xs uppercase">Points</span>
+                        <span className="text-emerald-400 font-bold">{userPoints}</span>
+                      </div>
+                      <div className="bg-zinc-900 p-4 rounded-xl border border-zinc-800 flex items-center justify-between">
+                        <span className="text-zinc-500 text-xs uppercase">$WUP</span>
+                        <span className="text-emerald-400 font-bold">{wupBalance.toFixed(2)}</span>
+                      </div>
+                    </div>
 
-                <button
-                  onClick={handleClaim}
-                  disabled={isClaimButtonDisabled}
-                  className={`w-full py-3 rounded-xl text-sm font-bold uppercase tracking-wide ${
-                    isClaimButtonDisabled
-                      ? 'bg-zinc-900 text-zinc-600 border border-zinc-800'
-                      : 'bg-emerald-500 text-black hover:bg-emerald-400'
-                  }`}
-                >
-                  {claimButtonText()}
-                </button>
+                    <button
+                      onClick={handleClaim}
+                      disabled={isClaimButtonDisabled}
+                      className={`w-full py-3 rounded-xl text-sm font-bold uppercase tracking-wide ${
+                        isClaimButtonDisabled
+                          ? 'bg-zinc-900 text-zinc-600 border border-zinc-800'
+                          : 'bg-emerald-500 text-black hover:bg-emerald-400'
+                      }`}
+                    >
+                      {claimButtonText()}
+                    </button>
+                  </>
+                )}
 
                 {displayName ? (
                   <div className="flex items-center gap-2 bg-zinc-900 border border-zinc-800 px-4 py-3 rounded-xl">
@@ -547,11 +478,11 @@ export default function Navbar() {
                       value={newName}
                       onChange={(e) => setNewName(e.target.value)}
                       className="flex-1 px-4 py-3 rounded-xl bg-zinc-900 border border-zinc-800 text-white focus:outline-none focus:border-emerald-500/50"
-                      disabled={isPending || isConfirming || savingToDb}
+                      disabled={savingToDb}
                     />
                     <button 
                       onClick={handleSetDisplayName} 
-                      disabled={isPending || isConfirming || savingToDb} 
+                      disabled={savingToDb} 
                       className="bg-zinc-800 hover:bg-zinc-700 px-4 rounded-xl text-white"
                     >
                       Save
@@ -561,29 +492,9 @@ export default function Navbar() {
               </div>
             )}
             
-            <button
-              onClick={() => {
-                handleWalletAction();
-                setIsMobileMenuOpen(false);
-              }}
-              className={`w-full mt-2 px-4 py-3 rounded-xl text-sm font-bold flex items-center justify-center gap-2 ${
-                isConnected
-                  ? 'bg-zinc-900 text-white border border-zinc-800 hover:border-red-500/50 hover:text-red-400' 
-                  : 'bg-white text-black hover:bg-emerald-400'
-              }`}
-            >
-              {isConnected ? (
-                <>
-                  <LogOut className="w-4 h-4" />
-                  Disconnect
-                </>
-              ) : (
-                <>
-                  <Wallet className="w-4 h-4" />
-                  Connect Wallet
-                </>
-              )}
-            </button>
+            <div className="mt-4">
+               <ConnectButton className="!w-full !justify-center !bg-zinc-900 !text-white !border !border-zinc-800 hover:!border-zinc-600 !py-3 !rounded-xl !font-bold" />
+            </div>
           </div>
         )}
       </div>

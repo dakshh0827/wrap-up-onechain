@@ -8,24 +8,19 @@ import {
   ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis,
   PolarRadiusAxis, Radar,
 } from "recharts";
-import axios from "axios";
 import toast from "react-hot-toast";
 import { useArticleStore } from "../stores/articleStore";
-import {
-  useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt,
-  useSwitchChain, useWatchContractEvent, useChainId,
-} from "wagmi";
-import {
-  WRAPUP_ABI, CONTRACT_ADDRESSES,
-} from "../wagmiConfig";
-import { decodeEventLog } from "viem";
+
+// --- ONECHAIN (SUI) IMPORTS ---
+import { Transaction } from '@mysten/sui/transactions';
+import { useCurrentAccount, useSuiClient, useSignAndExecuteTransaction } from '@mysten/dapp-kit';
+import { PACKAGE_ID, CLOCK_ID } from "../constants"; 
+
 import {
   Download, ExternalLink, AlertCircle, TrendingUp, MessageSquare,
   BarChart3, Globe, CheckCircle, XCircle, ChevronDown, ChevronUp,
   FileText, ThumbsUp, Hexagon, Link2, Loader, Circle, ArrowLeft
 } from "lucide-react";
-
-const API_BASE = "https://wrap-up-evolved.onrender.com/api";
 
 const SENTIMENT_COLORS = {
   Positive: "#10b981",
@@ -35,7 +30,7 @@ const SENTIMENT_COLORS = {
 };
 
 function PublishSteps({ step }) {
-  const steps = ["Save to DB", "Upload IPFS", "Sign Tx", "Confirmed"];
+  const steps = ["Verify Profile", "Upload IPFS", "Sign Tx", "Confirmed"];
   return (
     <div className="flex items-center gap-2 mt-4">
       {steps.map((s, i) => (
@@ -77,22 +72,16 @@ export default function ResearchReportPage() {
   const [research, setResearch] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [expandedSources, setExpandedSources] = useState({});
   const [commentText, setCommentText] = useState("");
-  const [replyingTo, setReplyingTo] = useState(null);
-  const [replyText, setReplyText] = useState("");
-  const [pendingCommentData, setPendingCommentData] = useState(null);
   const [hasUpvotedResearchLocal, setHasUpvotedResearchLocal] = useState(false);
-
   const [publishStep, setPublishStep] = useState(-1);
-  const [publishIpfsHash, setPublishIpfsHash] = useState(null);
 
-  const { address, isConnected } = useAccount();
-  const chainId = useChainId();
-  const { switchChain } = useSwitchChain();
-
-  const currentContractAddress =
-    CONTRACT_ADDRESSES[chainId] || CONTRACT_ADDRESSES[421614];
+  // --- ONECHAIN SETUP ---
+  const account = useCurrentAccount();
+  const suiClient = useSuiClient();
+  const { mutateAsync: signAndExecuteTransaction } = useSignAndExecuteTransaction();
+  const isConnected = !!account;
+  const address = account?.address;
 
   const {
     loadResearch,
@@ -120,252 +109,129 @@ export default function ResearchReportPage() {
     fetchResearch();
   }, [id]);
 
-  const { data: voteHash, isPending: isVoting, writeContract: writeVote } = useWriteContract();
-  const { data: commentHash, isPending: isCommenting, writeContract: writeComment } = useWriteContract();
-  const { data: publishHash, isPending: isPublishing, writeContract: writePublish, error: publishWriteError, isError: isPublishWriteError } = useWriteContract();
 
-  const { isLoading: isVoteConfirming, isSuccess: isVoteConfirmed, data: voteReceipt } = useWaitForTransactionReceipt({ hash: voteHash });
-  const { isLoading: isCommentConfirming, isSuccess: isCommentConfirmed, data: commentReceipt } = useWaitForTransactionReceipt({ hash: commentHash });
-  const { isLoading: isPublishConfirming, isSuccess: isPublishConfirmed, isError: isPublishTxError, error: publishTxError, data: publishReceipt } = useWaitForTransactionReceipt({ hash: publishHash });
-
-  const { data: hasUpvotedResearch, refetch: refetchHasUpvotedResearch } =
-    useReadContract({
-      abi: WRAPUP_ABI,
-      address: currentContractAddress,
-      functionName: "hasUpvotedArticle",
-      args: [address, research?.blockchainId],
-      enabled: isConnected && !!research?.blockchainId && research?.onChain,
-    });
-
-  const { data: userDisplayName } = useReadContract({
-    abi: WRAPUP_ABI,
-    address: currentContractAddress,
-    functionName: "displayNames",
-    args: [address],
-    enabled: isConnected && !!address,
-  });
-
-  useEffect(() => {
-    if (hasUpvotedResearch !== undefined) {
-      setHasUpvotedResearchLocal(hasUpvotedResearch);
-    }
-  }, [hasUpvotedResearch]);
-
-  useWatchContractEvent({
-    address: currentContractAddress,
-    abi: WRAPUP_ABI,
-    eventName: "CommentPosted",
-    enabled: !!research?.blockchainId && research?.onChain,
-    onLogs(logs) {
-      for (const log of logs) {
-        try {
-          const event = decodeEventLog({ abi: WRAPUP_ABI, data: log.data, topics: log.topics });
-          if (research?.blockchainId && event.args.articleId === BigInt(research.blockchainId)) {
-            fetchResearch();
-            toast.success("New comment detected!");
-          }
-        } catch {}
-      }
-    }
-  });
-
-  const callContract = (writeFn, config, toastId) => {
-    if (!CONTRACT_ADDRESSES[chainId]) {
-      toast.loading("Switching to supported network...", { id: toastId });
-      switchChain(
-        { chainId: 421614 },
-        {
-          onSuccess: () => writeFn({ ...config, address: CONTRACT_ADDRESSES[421614] }),
-          onError: () => toast.error("Network switch failed", { id: toastId }),
-        }
-      );
-    } else {
-      writeFn(config);
-    }
-  };
-
+  // ==========================================
+  // ONECHAIN: MINT AI REPORT TRANSACTION
+  // ==========================================
   const handlePublishToBlockchain = async () => {
-    if (!isConnected) { toast.error("Please connect wallet to publish on-chain"); return; }
-    if (research.onChain) { toast.error("Already published on blockchain"); return; }
+    if (!isConnected) { toast.error("Please connect your OneWallet"); return; }
+    if (research.onChain) { toast.error("Already published on OneChain"); return; }
 
+    const tid = toast.loading("Verifying OneChain Profile...");
     setPublishStep(0);
-    const tid = toast.loading("Publishing research on-chain...");
-    try {
-      await new Promise((r) => setTimeout(r, 400));
-      setPublishStep(1);
 
-      toast.loading("Uploading to IPFS...", { id: tid });
+    try {
+      // 1. Fetch User Profile Object from Wallet
+      const objects = await suiClient.getOwnedObjects({
+        owner: address,
+        filter: { StructType: `${PACKAGE_ID}::platform::UserProfile` },
+      });
+
+      if (objects.data.length === 0) {
+        throw new Error("No User Profile found. Please click 'Create Profile' in the Navbar first!");
+      }
+      const userProfileId = objects.data[0].data.objectId;
+
+      // 2. Upload to IPFS
+      setPublishStep(1);
+      toast.loading("Uploading AI Synthesis to IPFS...", { id: tid });
       const hash = await uploadResearchToIPFS(research.id);
       if (!hash) throw new Error("IPFS upload returned no hash");
-      setPublishIpfsHash(hash);
-      
-      toast.loading("Sign transaction in wallet...", { id: tid });
-      setPublishStep(2);
 
-      callContract(writePublish, {
-        address: currentContractAddress,
-        abi: WRAPUP_ABI,
-        functionName: "submitResearchReport",
-        args: [hash],
-      }, tid);
-    } catch (err) {
-      toast.error(err.message || "Publish failed", { id: tid });
+      // 3. Build & Sign Move Transaction
+      setPublishStep(2);
+      toast.loading("Please sign the transaction in OneWallet...", { id: tid });
+      
+      const tx = new Transaction();
+      tx.moveCall({
+        target: `${PACKAGE_ID}::platform::submit_ai_research`,
+        arguments: [
+          tx.object(userProfileId),
+          tx.pure.string(hash),
+          tx.object(CLOCK_ID)
+        ],
+      });
+
+      const response = await signAndExecuteTransaction({ transaction: tx });
+
+      toast.loading("Confirming on OneChain...", { id: tid });
+      const receipt = await suiClient.waitForTransaction({ 
+        digest: response.digest, 
+        options: { showEvents: true } 
+      });
+
+      // 4. Finalize DB Sync
+      setPublishStep(3);
+      toast.loading("Finalizing Database...", { id: tid });
+      
+      // Extract the new ResearchReport Object ID from the emitted event
+      const event = receipt.events?.find(e => e.type.includes('ReportSubmittedEvent'));
+      const blockchainId = event?.parsedJson?.report_id || response.digest;
+
+      await markResearchOnChainDB(research.id, blockchainId, address, hash);
+      
+      toast.success("AI Research Minted on OneChain!", { id: tid });
       setPublishStep(-1);
-      if (research?.id) {
+      fetchResearch();
+
+    } catch (err) {
+      console.error(err);
+      toast.error(err.message || "Minting failed", { id: tid });
+      setPublishStep(-1);
+      if (research?.id && publishStep < 2) {
         deleteResearchFromDB(research.id);
-        toast.error("Publish failed. Report deleted for consistency.");
+        toast.error("Process aborted. Report deleted for consistency.");
         navigate('/'); 
       }
     }
   };
 
-  useEffect(() => {
-    if (isPublishing) toast.loading("Waiting for wallet...", { id: "pubToast" });
-    if (isPublishConfirming) { setPublishStep(2); toast.loading("Confirming on blockchain...", { id: "pubToast" }); }
-
-    if (isPublishConfirmed && publishReceipt && publishIpfsHash) {
-      setPublishStep(3);
-      let blockchainId = null;
-      try {
-        for (const log of publishReceipt.logs) {
-          const event = decodeEventLog({ abi: WRAPUP_ABI, data: log.data, topics: log.topics });
-          if (event.eventName === "ArticleSubmitted") { blockchainId = event.args.articleId.toString(); break; }
-        }
-      } catch {}
-
-      if (blockchainId && address) {
-        toast.loading("Finalizing...", { id: "pubToast" });
-        markResearchOnChainDB(research.id, blockchainId, address, publishIpfsHash)
-          .then(() => {
-            toast.success("Research published on-chain!", { id: "pubToast" });
-            setTimeout(() => { setPublishStep(-1); fetchResearch(); }, 1500);
-          })
-          .catch((err) => { toast.error("DB sync failed: " + err.message, { id: "pubToast" }); setPublishStep(-1); });
-      } else {
-        toast.success("Published on-chain!", { id: "pubToast" });
-        setPublishStep(-1);
-        setTimeout(fetchResearch, 1500);
-      }
-    }
-
-    if (isPublishTxError || isPublishWriteError) {
-      toast.error(publishTxError?.shortMessage || publishWriteError?.shortMessage || "Transaction failed", { id: "pubToast" });
-      setPublishStep(-1);
-      if (research?.id) {
-        deleteResearchFromDB(research.id);
-        toast.error("Transaction failed. Report deleted for consistency.");
-        navigate('/');
-      }
-    }
-  }, [isPublishing, isPublishConfirming, isPublishConfirmed, isPublishTxError, isPublishWriteError, publishReceipt]);
-
+  // ==========================================
+  // OFF-CHAIN SOCIAL FEATURES (Hackathon MVP)
+  // ==========================================
   const handleUpvoteResearch = async () => {
     if (!isConnected) { toast.error("Please connect wallet"); return; }
-    if (!research.onChain) { toast.error("Research must be on-chain to upvote"); return; }
     if (hasUpvotedResearchLocal) { toast.error("Already upvoted"); return; }
 
     const toastId = toast.loading("Processing upvote...");
     setResearch((prev) => ({ ...prev, upvotes: prev.upvotes + 1 }));
     setHasUpvotedResearchLocal(true);
 
-    callContract(writeVote, {
-      address: currentContractAddress,
-      abi: WRAPUP_ABI,
-      functionName: "upvoteArticle",
-      args: [research.blockchainId],
-    }, toastId);
-  };
-
-  useEffect(() => {
-    if (isVoteConfirmed && voteReceipt) {
-      toast.success("Vote confirmed!");
-      let upvotes = 0;
-      try {
-        for (const log of voteReceipt.logs) {
-          const event = decodeEventLog({ abi: WRAPUP_ABI, data: log.data, topics: log.topics });
-          if (event.eventName === "Upvoted") { upvotes = Number(event.args.newUpvoteCount); break; }
-        }
-      } catch {}
-      if (upvotes > 0) syncResearchUpvotesDB(research.id, upvotes);
-      setTimeout(() => { fetchResearch(); refetchHasUpvotedResearch(); }, 3000);
+    try {
+      await syncResearchUpvotesDB(research.id, research.upvotes + 1);
+      toast.success("Vote recorded!", { id: toastId });
+    } catch (err) {
+      toast.error("Failed to upvote", { id: toastId });
     }
-  }, [isVoteConfirmed, voteReceipt]);
+  };
 
   const handleComment = async (e) => {
     e.preventDefault();
-    if (!commentText.trim()) { toast.error("Please enter a comment"); return; }
+    if (!commentText.trim()) return;
     if (!isConnected) { toast.error("Please connect wallet"); return; }
-    if (!research.onChain) { toast.error("Research must be on-chain to comment"); return; }
 
-    const toastId = toast.loading("Preparing comment...");
+    const toastId = toast.loading("Posting comment...");
     try {
-      const { commentMongoId, onChainResearchId, ipfsHash } =
-        await prepareResearchCommentForChain({
-          researchId: research.id,
-          content: commentText.trim(),
-          author: address,
-          authorName: userDisplayName || (address ? `${address.substring(0, 6)}...${address.substring(38)}` : ""),
-        });
+      // Create comment in DB
+      const { commentMongoId } = await prepareResearchCommentForChain({
+        researchId: research.id,
+        content: commentText.trim(),
+        author: address,
+        authorName: `${address.substring(0, 6)}...${address.substring(address.length - 4)}`,
+      });
 
-      setPendingCommentData({ commentMongoId, ipfsHash });
-      setResearch((prev) => ({
-        ...prev,
-        comments: [
-          {
-            id: commentMongoId, content: commentText.trim(), author: address, authorName: userDisplayName || "",
-            upvotes: 0, onChain: false, createdAt: new Date().toISOString(), replies: [],
-          },
-          ...(prev.comments || []),
-        ],
-      }));
+      // Bypass blockchain step for MVP demo, mark directly in DB
+      await markResearchCommentOnChainDB(commentMongoId, "off-chain-demo", "ipfs-hash-placeholder");
+
       setCommentText("");
-      toast.loading("Please confirm in wallet...", { id: toastId });
-
-      callContract(writeComment, {
-        address: currentContractAddress, abi: WRAPUP_ABI, functionName: "postComment", args: [onChainResearchId, ipfsHash],
-      }, toastId);
-    } catch (err) {
-      toast.error(err.message || "Failed to prepare comment", { id: toastId });
+      toast.success("Comment posted!", { id: toastId });
       fetchResearch();
+    } catch (err) {
+      toast.error(err.message || "Failed to post comment", { id: toastId });
     }
   };
-
-  useEffect(() => {
-    if (isCommentConfirmed && commentReceipt && pendingCommentData) {
-      toast.success("Comment posted!");
-      let onChainCommentId = null;
-      try {
-        for (const log of commentReceipt.logs) {
-          const event = decodeEventLog({ abi: WRAPUP_ABI, data: log.data, topics: log.topics });
-          if (event.eventName === "CommentPosted") { onChainCommentId = event.args.commentId.toString(); break; }
-        }
-      } catch {}
-      if (onChainCommentId) {
-        markResearchCommentOnChainDB(pendingCommentData.commentMongoId, onChainCommentId, pendingCommentData.ipfsHash);
-      }
-      setTimeout(() => fetchResearch(), 3000);
-    }
-  }, [isCommentConfirmed, commentReceipt, pendingCommentData]);
-
-  const handleUpvoteComment = async (comment) => {
-    if (!isConnected) { toast.error("Please connect wallet"); return; }
-    if (!comment.onChain) { toast.error("Comment not on-chain yet"); return; }
-    if (comment.upvotedBy?.some((v) => typeof v === "string" ? v === address : v.address?.toLowerCase() === address?.toLowerCase())) { 
-      toast.error("Already upvoted"); return; 
-    }
-
-    callContract(writeVote, {
-      address: currentContractAddress, abi: WRAPUP_ABI, functionName: "upvoteComment", args: [comment.commentId],
-    }, "upvoteCommentToast");
-  };
-
-  const toggleSource = (idx) => setExpandedSources((prev) => ({ ...prev, [idx]: !prev[idx] }));
 
   const renderComment = (comment, isReply = false) => {
-    const hasUpvoted = comment.upvotedBy?.some((v) => typeof v === "string" ? v === address : v.address?.toLowerCase() === address?.toLowerCase());
-    const isCommenter = comment.author?.toLowerCase() === address?.toLowerCase();
-    const canUpvote = isConnected && !isCommenter && !hasUpvoted && comment.onChain;
-
     return (
       <div key={comment.id} className={`${isReply ? "ml-8 pl-8 border-l border-zinc-800/50 mt-4" : "mb-6 pb-6 border-b border-zinc-800/50 last:border-0"}`}>
         <div className="flex items-start justify-between mb-3">
@@ -380,27 +246,8 @@ export default function ResearchReportPage() {
               </span>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => handleUpvoteComment(comment)}
-              disabled={!canUpvote}
-              className={`flex items-center gap-1.5 px-3 py-1 rounded-lg border text-xs font-medium transition-colors ${
-                !canUpvote ? "border-transparent text-zinc-600" : "border-zinc-800 text-zinc-400 hover:text-emerald-400 hover:border-emerald-500/50 bg-zinc-900/50"
-              }`}
-            >
-              <ThumbsUp className="w-3 h-3" /> {comment.upvotes}
-            </button>
-            {comment.onChain ? (
-              <Hexagon className="w-3.5 h-3.5 text-emerald-400" />
-            ) : (
-              <span className="w-2.5 h-2.5 rounded-full bg-yellow-500 animate-pulse" />
-            )}
-          </div>
         </div>
         <p className="text-zinc-300 mb-3 leading-relaxed text-sm">{comment.content}</p>
-        {comment.replies?.length > 0 && (
-          <div className="mt-4">{comment.replies.map((r) => renderComment(r, true))}</div>
-        )}
       </div>
     );
   };
@@ -464,7 +311,7 @@ export default function ResearchReportPage() {
                 </span>
                 {research.onChain ? (
                   <span className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 px-4 py-1.5 rounded-lg flex items-center gap-2 font-medium shadow-[0_0_10px_rgba(16,185,129,0.1)]">
-                    <Hexagon className="w-4 h-4" /> On-Chain #{research.blockchainId}
+                    <Hexagon className="w-4 h-4" /> OneChain #{research.blockchainId.substring(0,8)}...
                   </span>
                 ) : (
                   <span className="bg-yellow-500/10 border border-yellow-500/30 text-yellow-500 px-4 py-1.5 rounded-lg font-medium">
@@ -478,15 +325,15 @@ export default function ResearchReportPage() {
               {!research.onChain && isConnected && (
                 <button
                   onClick={handlePublishToBlockchain}
-                  disabled={isPublishInProgress || isPublishing || isPublishConfirming}
+                  disabled={isPublishInProgress}
                   className="bg-emerald-500 text-black px-8 py-3.5 rounded-xl font-bold flex items-center gap-2 hover:bg-emerald-400 transition-all shadow-lg shadow-emerald-500/20 disabled:opacity-60"
                 >
-                  {isPublishInProgress || isPublishing || isPublishConfirming ? (
+                  {isPublishInProgress ? (
                     <Loader className="w-5 h-5 animate-spin" />
                   ) : (
                     <Link2 className="w-5 h-5" />
                   )}
-                  {isPublishInProgress || isPublishing || isPublishConfirming ? "Minting..." : "Mint Report"}
+                  {isPublishInProgress ? "Minting..." : "Mint Report"}
                 </button>
               )}
               {!research.onChain && !isConnected && (
@@ -515,7 +362,7 @@ export default function ResearchReportPage() {
           </div>
         </div>
 
-        {/* Content Blocks using unified glassmorphic style */}
+        {/* Content Blocks */}
         
         {/* Executive Summary */}
         <section className="bg-zinc-900/40 backdrop-blur-md border border-zinc-800/80 rounded-3xl p-8 md:p-10 mb-8 shadow-xl">
@@ -702,116 +549,7 @@ export default function ResearchReportPage() {
               </div>
             </div>
           </div>
-          
-          {research.consensusVsContradiction.minorityPerspectives?.length > 0 && (
-            <div className="bg-purple-500/5 border border-purple-500/20 rounded-2xl p-6 shadow-inner">
-              <h3 className="font-bold text-lg mb-4 text-purple-300 flex items-center gap-2">
-                <AlertCircle className="w-5 h-5" /> Minority Perspectives
-              </h3>
-              <ul className="grid sm:grid-cols-2 gap-4 text-zinc-300 text-sm">
-                {research.consensusVsContradiction.minorityPerspectives.map((p, idx) => (
-                  <li key={idx} className="flex gap-2.5 bg-zinc-950/50 p-3 rounded-xl border border-zinc-800/50">
-                    <span className="text-purple-400 flex-shrink-0 mt-0.5">◆</span>
-                    <span className="leading-relaxed">{p}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
         </section>
-
-        {/* Source Comparison Report */}
-        {research.sourceComparisonReport && (
-          <section className="bg-zinc-900/40 backdrop-blur-md border border-zinc-800/80 rounded-3xl p-8 md:p-10 mb-8 shadow-xl">
-            <div className="border-b border-zinc-800/50 pb-4 mb-8">
-              <h2 className="text-2xl font-bold flex items-center gap-3">
-                <BarChart3 className="w-6 h-6 text-emerald-400" /> Granular Source Comparison
-              </h2>
-            </div>
-            
-            <div className="overflow-x-auto mb-8 rounded-2xl border border-zinc-800 bg-zinc-950/50">
-              <table className="w-full text-sm text-left">
-                <thead className="bg-zinc-900/80">
-                  <tr>
-                    {["#", "Source", "Platform", "Credibility", "Depth", "Bias", "Uniqueness"].map((h) => (
-                      <th key={h} className="p-4 text-zinc-400 font-bold text-xs uppercase tracking-wider border-b border-zinc-800">{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-zinc-800/50">
-                  {(research.sourceComparisonReport.sourceRatings || []).map((s) => {
-                    const isRec = (research.sourceComparisonReport.recommendedReading || []).includes(s.index);
-                    return (
-                      <tr key={s.index} className={`hover:bg-zinc-900/50 transition-colors ${isRec ? "bg-emerald-500/5" : ""}`}>
-                        <td className="p-4 text-zinc-500 font-mono font-bold">{s.index}</td>
-                        <td className="p-4 max-w-[200px]">
-                          <a href={s.url} target="_blank" rel="noopener noreferrer" className="text-emerald-400 hover:text-emerald-300 font-medium flex items-center gap-1.5 text-xs leading-snug">
-                            <span className="truncate">{s.title}</span>
-                            <ExternalLink className="w-3 h-3 flex-shrink-0" />
-                          </a>
-                          {isRec && <span className="text-[10px] font-bold uppercase tracking-widest bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded mt-2 inline-block shadow-sm">Recommended</span>}
-                        </td>
-                        <td className="p-4 text-zinc-400 capitalize text-xs font-medium">{s.platform}</td>
-                        {[{ val: s.credibility, color: "#10b981" }, { val: s.depth, color: "#3b82f6" }].map((bar, i) => (
-                          <td key={i} className="p-4">
-                            <div className="flex items-center gap-3">
-                              <div className="w-16 h-1.5 bg-zinc-800 rounded-full overflow-hidden shadow-inner">
-                                <div className="h-full rounded-full" style={{ width: `${bar.val * 10}%`, backgroundColor: bar.color }} />
-                              </div>
-                              <span className="text-xs text-zinc-300 font-mono font-bold">{bar.val}</span>
-                            </div>
-                          </td>
-                        ))}
-                        <td className="p-4">
-                          <span className={`text-[11px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md shadow-sm border ${
-                            s.bias === "Low" ? "bg-green-500/10 text-green-400 border-green-500/20" : 
-                            s.bias === "High" ? "bg-red-500/10 text-red-400 border-red-500/20" : 
-                            "bg-yellow-500/10 text-yellow-400 border-yellow-500/20"
-                          }`}>{s.bias}</span>
-                        </td>
-                        <td className="p-4">
-                          <div className="flex items-center gap-3">
-                            <div className="w-16 h-1.5 bg-zinc-800 rounded-full overflow-hidden shadow-inner">
-                              <div className="h-full rounded-full bg-purple-500" style={{ width: `${s.uniqueness * 10}%` }} />
-                            </div>
-                            <span className="text-xs text-zinc-300 font-mono font-bold">{s.uniqueness}</span>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="grid lg:grid-cols-3 gap-6">
-              {research.sourceComparisonReport.mostCredibleSource && (
-                <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-2xl p-5 shadow-inner">
-                  <div className="text-[11px] font-bold text-emerald-400 uppercase tracking-widest mb-3 flex items-center gap-2">
-                    <TrophyIcon className="w-3.5 h-3.5" /> Most Credible
-                  </div>
-                  <div className="text-white font-bold text-lg mb-2">Source #{research.sourceComparisonReport.mostCredibleSource.index}</div>
-                  <div className="text-zinc-400 text-sm leading-relaxed">{research.sourceComparisonReport.mostCredibleSource.reason}</div>
-                </div>
-              )}
-              {research.sourceComparisonReport.mostUniqueSource && (
-                <div className="bg-purple-500/5 border border-purple-500/20 rounded-2xl p-5 shadow-inner">
-                  <div className="text-[11px] font-bold text-purple-400 uppercase tracking-widest mb-3 flex items-center gap-2">
-                    <ZapIcon className="w-3.5 h-3.5" /> Most Unique
-                  </div>
-                  <div className="text-white font-bold text-lg mb-2">Source #{research.sourceComparisonReport.mostUniqueSource.index}</div>
-                  <div className="text-zinc-400 text-sm leading-relaxed">{research.sourceComparisonReport.mostUniqueSource.reason}</div>
-                </div>
-              )}
-              {research.sourceComparisonReport.overallVerdict && (
-                <div className="bg-zinc-950/50 border border-zinc-800/80 rounded-2xl p-5 shadow-inner">
-                  <div className="text-[11px] font-bold text-zinc-400 uppercase tracking-widest mb-3">Overall Verdict</div>
-                  <div className="text-zinc-300 text-sm leading-relaxed">{research.sourceComparisonReport.overallVerdict}</div>
-                </div>
-              )}
-            </div>
-          </section>
-        )}
 
         {/* Upvote & Discussion - Minted Only */}
         {research.onChain && (
@@ -832,16 +570,16 @@ export default function ResearchReportPage() {
                 </div>
                 <button
                   onClick={handleUpvoteResearch}
-                  disabled={!isConnected || hasUpvotedResearchLocal || isVoting}
+                  disabled={!isConnected || hasUpvotedResearchLocal}
                   className={`w-full py-4 rounded-xl font-bold uppercase tracking-wider transition-all shadow-lg ${
-                    !isConnected || hasUpvotedResearchLocal || isVoting
+                    !isConnected || hasUpvotedResearchLocal
                       ? "bg-zinc-900 text-zinc-600 border border-zinc-800 cursor-not-allowed"
                       : "bg-emerald-500 text-black hover:bg-emerald-400 shadow-emerald-500/20"
                   }`}
                 >
                   <span className="flex items-center justify-center gap-2">
                     <ThumbsUp className="w-5 h-5" />
-                    {isVoting ? "Voting..." : hasUpvotedResearchLocal ? "Upvoted" : "Upvote Report"}
+                    {hasUpvotedResearchLocal ? "Upvoted" : "Upvote Report"}
                   </span>
                 </button>
               </section>
@@ -863,21 +601,20 @@ export default function ResearchReportPage() {
                       value={commentText}
                       onChange={(e) => setCommentText(e.target.value)}
                       placeholder="Share your thoughts on this synthesis..."
-                      disabled={isCommenting}
                     />
                     <div className="flex justify-end mt-2 pt-2 border-t border-zinc-800/50">
                       <button
                         type="submit"
-                        disabled={isCommenting || !commentText.trim()}
+                        disabled={!commentText.trim()}
                         className="bg-emerald-500 text-black px-6 py-2 rounded-lg font-bold text-sm uppercase tracking-wide hover:bg-emerald-400 disabled:opacity-50 transition-colors shadow-lg shadow-emerald-500/20"
                       >
-                        {isCommenting ? "Posting..." : "Comment"}
+                         Comment
                       </button>
                     </div>
                   </form>
                 ) : (
                   <div className="bg-zinc-950/50 p-8 text-center border border-zinc-800/80 rounded-2xl mb-10 shadow-inner">
-                    <p className="text-zinc-400 text-sm font-medium">Connect your wallet to join the discussion.</p>
+                    <p className="text-zinc-400 text-sm font-medium">Connect your OneWallet to join the discussion.</p>
                   </div>
                 )}
 
@@ -898,12 +635,4 @@ export default function ResearchReportPage() {
       <Footer />
     </div>
   );
-}
-
-// Simple internal icon components for layout
-function TrophyIcon(props) {
-  return <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}><path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"/><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"/><path d="M4 22h16"/><path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"/><path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"/><path d="M18 2H6v7a6 6 0 0 0 12 0V2Z"/></svg>;
-}
-function ZapIcon(props) {
-  return <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>;
 }
