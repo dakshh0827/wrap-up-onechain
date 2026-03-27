@@ -18,7 +18,7 @@ import {
   Globe, Zap, X, ArrowRight, CheckCircle, Circle, Loader, Scale, Link2
 } from "lucide-react";
 
-const API_BASE = 'http://localhost:5001/api';
+const API_BASE = 'https://wrap-up-onechain.onrender.com/api';
 
 export default function ResearchLandingPage() {
   const [topic, setTopic] = useState("");
