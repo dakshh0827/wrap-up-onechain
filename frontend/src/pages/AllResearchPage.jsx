@@ -8,7 +8,7 @@ import { Button, Card, Badge } from "../components/ui";
 import axios from "axios";
 import { Brain, Calendar, User, ThumbsUp, MessageSquare, Hexagon, TrendingUp, ChevronLeft, ChevronRight } from "lucide-react";
 
-const API_BASE = 'http://localhost:5001/api';
+const API_BASE = 'https://wrap-up-onechain.onrender.com/api';
 
 export default function AllResearchPage() {
   const [research, setResearch] = useState([]);
