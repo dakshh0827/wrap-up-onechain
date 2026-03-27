@@ -23,7 +23,7 @@ import {
 } from "lucide-react";
 import { useArticleStore } from "../stores/articleStore";
 
-const API_BASE = 'http://localhost:5001/api';
+const API_BASE = 'https://wrap-up-onechain.onrender.com/api';
 
 const DIMENSION_META = {
   credibility:    { label: "Credibility",    icon: Shield,      color: "#10b981" },
