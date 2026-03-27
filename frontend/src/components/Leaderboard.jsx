@@ -4,7 +4,7 @@ import { Card } from './ui';
 import axios from 'axios';
 import { Trophy, ThumbsUp, MessageSquare, Star, FileText } from 'lucide-react';
 
-const API_BASE = 'http://localhost:5001/api';
+const API_BASE = 'https://wrap-up-onechain.onrender.com/api';
 
 export default function Leaderboard() {
   const [leaderboard, setLeaderboard] = useState([]);
