@@ -18,7 +18,7 @@ import { useCurrentAccount, useSuiClient, useSignAndExecuteTransaction } from '@
 import { Transaction } from '@mysten/sui/transactions';
 import { PACKAGE_ID, CLOCK_ID } from "../constants"; 
 
-const API_BASE = 'http://localhost:5001/api';
+const API_BASE = 'https://wrap-up-onechain.onrender.com/api';
 
 export default function LegacyLandingPage() {
   const [url, setUrl] = useState("");
